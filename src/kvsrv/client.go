@@ -4,8 +4,6 @@ import (
 	"crypto/rand"
 	"log"
 	"math/big"
-	"sync"
-	"sync/atomic"
 
 	"6.5840/labrpc"
 )
@@ -18,43 +16,14 @@ type Clerk struct {
 	// TODO:
 	// 1. add response state to make server delete some history ?
 	// recored X, which all response below X had been seen by client.
-	mu       sync.Mutex
-	succReqs map[int64]bool
-	ack      int64 // default value is seq. If seq of request equal ack, then ack is invalid
 }
 
 // update statistic of successful request
-func (c *Clerk) updateReq(seq int64) {
-	if seq < c.ack {
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.ack = seq + 1
-
-	// c.succReqs[seq] = true
-	// nAck := c.ack
-	// for {
-	// 	if _, ok := c.succReqs[nAck]; !ok {
-	// 		break
-	// 	}
-	// 	delete(c.succReqs, nAck)
-	// 	nAck++
-	// }
-
-	// c.ack = nAck
-}
-
-func (c *Clerk) getAck() int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.ack
-}
 
 func (c *Clerk) getSeq() int64 {
-	return atomic.AddInt64(&c.seq, 1) - 1
+	o := c.seq
+	c.seq = c.seq + 1
+	return o
 }
 
 func nrand() int64 {
@@ -72,8 +41,6 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 
 	ck.id = nrand()
 
-	ck.succReqs = make(map[int64]bool)
-
 	return ck
 }
 
@@ -89,12 +56,11 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 
-	args := GetArgs{ck.id, ck.getSeq(), ck.getAck(), key}
+	args := GetArgs{ck.id, ck.getSeq(), key}
 	reply := GetReply{}
 
 	for {
 		if ck.server.Call("KVServer.Get", &args, &reply) {
-			ck.updateReq(args.Seq)
 			break
 		}
 	}
@@ -115,12 +81,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) string {
 		log.Fatalf("unknown op %v", op)
 	}
 
-	args := PutAppendArgs{ck.id, ck.getSeq(), ck.getAck(), key, value}
+	args := PutAppendArgs{ck.id, ck.getSeq(), key, value}
 	reply := PutAppendReply{}
 
 	for {
 		if ck.server.Call("KVServer."+op, &args, &reply) {
-			ck.updateReq(args.Seq)
 			break
 		}
 	}

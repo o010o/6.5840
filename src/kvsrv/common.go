@@ -4,7 +4,6 @@ package kvsrv
 type PutAppendArgs struct {
 	Cid   int64
 	Seq   int64
-	Ack   int64
 	Key   string
 	Value string
 	// You'll have to add definitions here.
@@ -19,7 +18,6 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Cid int64
 	Seq int64
-	Ack int64
 	Key string
 
 	// You'll have to add definitions here.

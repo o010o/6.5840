@@ -23,12 +23,8 @@ type KVServer struct {
 	mu sync.Mutex
 
 	database map[string]string
-	// TODO:
-	// we can remove old information by normal communicaing
-	// but for abnormal exit?
 
-	// golang has string interning, which means same string with use same pointer!
-
+	// FIXME: How to remove old information if client exit?
 	historys map[int64]history
 }
 
@@ -58,14 +54,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// ------------------------test-----------------------
-
-	// defer kv.memoryUsed()
-	// defer fmt.Print(kv)
-
-	// fmt.Printf("get: Cid=%v Seq=%v Ack=%v keylen=%v\n", args.Cid, args.Seq, args.Ack, len(args.Key))
-	// ------------------------test-----------------------
-
 	kv.removeValueInHistory(args.Cid, args.Seq)
 
 	// Seems that return an newest value is ok
@@ -80,13 +68,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
-	// ------------------------test-----------------------
-	// defer kv.memoryUsed()
-	// defer fmt.Print(kv)
-
-	// fmt.Printf("put: Cid=%v Seq=%v Ack=%v key=%v valuelen=%v\n", args.Cid, args.Seq, args.Ack, args.Key, len(args.Value))
-	// ------------------------test-----------------------
 
 	if v := kv.getValueFromHistory(args.Cid, args.Seq); v != nil {
 		reply.Value = *v

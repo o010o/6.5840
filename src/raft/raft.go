@@ -344,7 +344,6 @@ func (rf *Raft) sendHeartBeat() {
 					// discover higher term, transform to follower
 					rf.transformTo(Follower)
 					rf.updateTerm(reply.Term)
-					rf.extendTerm()
 				}
 				rf.mu.Unlock()
 			}
@@ -475,11 +474,11 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 
 		if rf.checkTermTimeout() {
-			rf.startElection()
+			go rf.startElection()
 		}
 
 		// milliseconds.120~250
-		ms := 100 + (rand.Int63() % 300)
+		ms := 100 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }

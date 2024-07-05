@@ -70,8 +70,10 @@ type Raft struct {
 
 	term     int           // term of current server
 	state    RaftStateType // state of current server
-	voteTerm int           // last vote at which term
 	isRecvHB bool          // did this server receive heartbeat recently?
+
+	// election
+	// heartbeat
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
@@ -79,13 +81,12 @@ type Raft struct {
 }
 
 func (rf *Raft) String() string {
-	return fmt.Sprintf("me:%v, term:%v, state:%v, voteTerm:%v, isRecvHB:%v", rf.me, rf.term, rf.state, rf.voteTerm, rf.isRecvHB)
+	return fmt.Sprintf("me:%v, term:%v, state:%v,  isRecvHB:%v", rf.me, rf.term, rf.state, rf.isRecvHB)
 }
 
 func (rf *Raft) Construct() {
 	rf.term = 0
 	rf.state = Follower
-	rf.voteTerm = -1
 	rf.isRecvHB = false
 }
 
@@ -162,10 +163,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	if args.E.isHeartBeat() {
 		// heartbeat message
-		if args.E.Term >= rf.term && rf.state != Follower {
-			// discover a higher term, transform to follower
-			rf.transformTo(Follower)
-		}
+		rf.transformTo(Follower)
 		(*reply) = AppendEntryReply{true, rf.term}
 		rf.updateTerm(args.E.Term)
 		return
@@ -240,9 +238,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	// Your code here (3A, 3B).
-	if args.Term <= rf.term || args.Term == rf.voteTerm {
+	if args.Term <= rf.term {
 		*reply = RequestVoteReply{false, rf.term}
 		return
 	}
@@ -251,7 +248,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	old := rf.term
 	rf.updateTerm(args.Term)
 	rf.transformTo(Follower)
-	rf.voteTerm = args.Term
 	rf.extendTerm()
 
 	*reply = RequestVoteReply{true, old}
@@ -348,34 +344,20 @@ func (rf *Raft) sendHeartBeat() {
 					// discover higher term, transform to follower
 					rf.transformTo(Follower)
 					rf.updateTerm(reply.Term)
+					rf.extendTerm()
 				}
-				rf.extendTerm()
 				rf.mu.Unlock()
 			}
 		}(c)
 	}
 }
 
-func (rf *Raft) heartbeat() {
-	for !rf.killed() {
-		// send heartbeat message if current server is a leader!
-		if rf.GetRaftState() == Leader {
-			rf.sendHeartBeat()
-		}
-
-		// send heartbeat per 100 ms
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (rf *Raft) startElection() bool {
+func (rf *Raft) fetchVotesUntil(term int, agreeMin int, rejectMax int) (int, int) {
 	voteRes := make(chan bool, len(rf.peers)-1)
+	serverTerms := make(chan int, len(rf.peers)-1)
 
-	rf.mu.Lock()
-	rf.updateTerm(rf.term + 1)
-	term := rf.term
-	rf.mu.Unlock()
-
+	// get votes from other server
+	// fmt.Printf("%v begin request vote, rf=[%v]\n", rf.me, rf)
 	for i := 0; i < len(rf.peers); i++ {
 		// send heartbeat to other server
 		if i == rf.me {
@@ -385,34 +367,77 @@ func (rf *Raft) startElection() bool {
 		go func(client *labrpc.ClientEnd, index int) {
 			args := RequestVoteArgs{term}
 			reply := RequestVoteReply{}
-			if client.Call("Raft.RequestVote", &args, &reply) {
+			// labrpc.go may block here rather than timeout,
+			if ok := client.Call("Raft.RequestVote", &args, &reply); ok {
+				// fmt.Printf("%v receive vote from %v, reply=[%v]\n", rf.me, index, reply)
 				voteRes <- reply.Ok
+				serverTerms <- reply.Term
 			} else {
+				// fmt.Printf("%v do not receive vote from %v, reply=[%v]\n", rf.me, index, reply)
 				voteRes <- false
+				serverTerms <- 0
 			}
-
 			// if we discover higher term or there is a leader, for simplify, dont change state now, change it until heartbeat from leader.
 		}(rf.peers[i], i)
 	}
 
-	// waiting vote result
+	// check result
 	agress := 1
+	reject := 0
+	maxTerm := 0
 	for i := 0; i < len(rf.peers)-1; i++ {
 		res := <-voteRes
+		t := <-serverTerms
 		if res {
 			agress++
+		} else {
+			reject++
 		}
-		if agress >= (len(rf.peers)+1+1)/2 {
+		if t > maxTerm {
+			maxTerm = t
+		}
+
+		if agress >= agreeMin || reject >= rejectMax {
 			break
 		}
 	}
 
-	if agress >= (len(rf.peers)+1+1)/2 {
-		//  generate enough vote, need to transform to Leader
-		// win if get over half votes
-		rf.mu.Lock()
-		rf.transformTo(Leader)
+	return agress, maxTerm
+}
+
+func (rf *Raft) startElection() bool {
+	rf.mu.Lock()
+	if rf.state == Leader {
 		rf.mu.Unlock()
+		return false
+	}
+	rf.transformTo(Candidate)
+	rf.updateTerm(rf.term + 1)
+	term := rf.term
+	rf.mu.Unlock()
+
+	// FIXME: election still too slow, can we use asynchronous way
+	// win if get over half votes
+	agreeMin := (len(rf.peers) + 1 + 1) / 2
+	rejectMax := (len(rf.peers) + 1) / 2
+	agrees, maxTerm := rf.fetchVotesUntil(term, agreeMin, rejectMax)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state == Follower {
+		return false
+	}
+
+	if maxTerm > rf.term {
+		// fmt.Printf("%v discover a higher term, rf=[%v]\n", rf.me, rf)
+		rf.transformTo(Follower)
+		rf.updateTerm(maxTerm)
+	} else if agrees >= agreeMin {
+		// fmt.Printf("%v win, rf=[%v]\n", rf.me, rf)
+		rf.transformTo(Leader)
+	} else {
+		// fmt.Printf("%v lose, rf=[%v]\n", rf.me, rf)
 	}
 
 	return true
@@ -433,20 +458,15 @@ func (rf *Raft) checkTermTimeout() bool {
 	return timeout
 }
 
-// lock outside
-func (rf *Raft) handleTimeout() {
-	st := rf.GetRaftState()
+func (rf *Raft) heartbeat() {
+	for !rf.killed() {
+		// send heartbeat message if current server is a leader!
+		if rf.GetRaftState() == Leader {
+			rf.sendHeartBeat()
+		}
 
-	if st == Follower {
-		// follower start a election
-		rf.mu.Lock()
-		rf.transformTo(Candidate)
-		rf.mu.Unlock()
-
-		rf.startElection()
-	} else if st == Candidate {
-		// candidate start a election
-		rf.startElection()
+		// heartbeat timeout must below than term timeout
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -455,12 +475,11 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 
 		if rf.checkTermTimeout() {
-			rf.handleTimeout()
+			rf.startElection()
 		}
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		// milliseconds.120~250
+		ms := 100 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }

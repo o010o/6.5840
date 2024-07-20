@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -291,7 +293,7 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	term      int                 // term of current server
-	voteAt    int                 // term of latest vote
+	voteFor   int                 // vote for which server this term
 	state     RaftStateType       // state of current server
 	isRecvHB  bool                // did this server receive heartbeat recently?
 	log       raftLog             // content of log entry
@@ -355,15 +357,16 @@ type entryDescriptor struct {
 }
 
 type AppendEntryArgs struct {
+	leaderId int             // id of the leader who sends this message
 	E        logEntry        // entry need to be appended
-	Index    int             // index of entry E
+	PreIndex int             // index of entry E
 	PreTerm  int             // term of previous entry of E
 	Term     int             // term of server
 	Commited entryDescriptor // latest entry Commited to state machine
 }
 
 func (aep *AppendEntryArgs) String() string {
-	return fmt.Sprintf("curEntry=[%v, %v], preEntry=[%v, %v], serverTerm=%v, commited=[%v, %v]", aep.Index, aep.E.Term, aep.Index-1, aep.PreTerm, aep.Term, aep.Commited.Index, aep.Commited.Term)
+	return fmt.Sprintf("curEntry=[%v, %v], preEntry=[%v, %v], serverTerm=%v, commited=[%v, %v]", aep.PreIndex+1, aep.E.Term, aep.PreIndex, aep.PreTerm, aep.Term, aep.Commited.Index, aep.Commited.Term)
 }
 
 type ConflictInfo struct {
@@ -405,7 +408,8 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	// append entry at specific location
-	state, conflict := rf.log.appendAt(args.Index-1, args.PreTerm, &args.E)
+	state, conflict := rf.log.appendAt(args.PreIndex, args.PreTerm, &args.E)
+
 	(*reply) = AppendEntryReply{state, rf.term, conflict}
 }
 
@@ -425,6 +429,19 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	// TODO:lock?
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log.entries)
+	e.Encode(rf.log.startAt)
+	e.Encode(rf.log.maxCommitedIndex)
+	e.Encode(rf.machine.applied)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -445,6 +462,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&rf.term) != nil ||
+		d.Decode(&rf.voteFor) != nil ||
+		d.Decode(&rf.state) != nil ||
+		d.Decode(&rf.log.entries) != nil ||
+		d.Decode(&rf.log.startAt) != nil ||
+		d.Decode(&rf.log.maxCommitedIndex) != nil ||
+		d.Decode(&rf.machine.applied) != nil {
+
+		log.Fatalf("readPersist: error decode")
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -458,17 +489,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term     int             // term of candidate
-	Commited entryDescriptor // commited info of candidate
-	Latest   entryDescriptor
+	candidateId int
+	Term        int             // term of candidate
+	Commited    entryDescriptor // commited info of candidate
+	Latest      entryDescriptor
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Ok   bool
-	Term int // term of server which sends reply
+	VoteGranted bool
+	Term        int // term of server which sends reply
 }
 
 // example RequestVote RPC handler.
@@ -478,7 +510,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 
 	// only vote for candidate who has higher term
-	if args.Term < rf.term || args.Term == rf.voteAt {
+	if args.Term < rf.term {
 		*reply = RequestVoteReply{false, rf.term}
 		return
 	}
@@ -503,11 +535,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if rf.voteFor != -1 {
+		// have voted this term
+		*reply = RequestVoteReply{false, old}
+		return
+	}
+
 	// vote
 	// vote during this term, dont start a new election recently
 	rf.extendTerm()
 
-	rf.voteAt = rf.term
+	rf.voteFor = args.candidateId
 	*reply = RequestVoteReply{true, old}
 }
 
@@ -518,12 +556,14 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 		log.Fatalf("log entry of 0 is invalid")
 	}
 
-	pre, _ := rf.log.copyEntry(eIndex - 1)
+	preIndex := eIndex - 1
+	pre, _ := rf.log.copyEntry(preIndex)
 	if pre.Term == -1 {
 		log.Fatalf("copyEntryTo:get previous log entry failed")
 	}
 
-	args := AppendEntryArgs{*entry, eIndex, pre.Term, thisTerm, rf.machine.getApplied()}
+	// TODO: send multiple entry if possible
+	args := AppendEntryArgs{rf.me, *entry, preIndex, pre.Term, thisTerm, rf.machine.getApplied()}
 	reply := AppendEntryReply{}
 
 	// send small commited log entry first to avoid follower can not catch up leader
@@ -547,7 +587,6 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 		// overtime, retry until term changed
 	}
 
-	// TODO:optimization, bypass nextSendIndex by add more information in reply
 	// get index of next log entry need to be sended.
 	switch reply.State {
 	case appendStateSucc:
@@ -571,9 +610,7 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 			log.Fatalf("why append the first log entry failed?")
 		}
 
-		// optimize, skip more than one log entry if previous log entry is not exist.
-		// compare pre and conflict log entry,
-
+		// optimization, bypass nextSendIndex by add more information in reply
 		if eIndex-1 >= reply.Conflict.LogLen {
 			// follower log entry with preIndex is not exist, send log entry with index=conflict.LogLen
 			return reply.Conflict.LogLen
@@ -771,7 +808,7 @@ func (rf *Raft) sendHeartBeat() {
 		}
 
 		go func(client *labrpc.ClientEnd) {
-			args := AppendEntryArgs{logEntry{term, nil}, 0, 0, term, rf.machine.getApplied()}
+			args := AppendEntryArgs{rf.me, logEntry{term, nil}, 0, 0, term, rf.machine.getApplied()}
 			reply := AppendEntryReply{}
 			if client.Call("Raft.AppendEntries", &args, &reply) {
 				rf.mu.Lock()
@@ -798,15 +835,15 @@ func (rf *Raft) fetchVotesUntil(term int, agreeMin int, rejectMax int) (int, int
 		}
 
 		go func(client *labrpc.ClientEnd, index int) {
-			args := RequestVoteArgs{term, rf.machine.getApplied(), rf.log.getLatestED()}
+			args := RequestVoteArgs{rf.me, term, rf.machine.getApplied(), rf.log.getLatestED()}
 			reply := RequestVoteReply{}
 			// labrpc.go may block here rather than timeout,
 			if ok := client.Call("Raft.RequestVote", &args, &reply); ok {
-				fmt.Printf("%v receive vote from %v, reply=[%v]\n", rf.me, index, reply)
-				voteCh <- reply.Ok
+				// fmt.Printf("%v receive vote from %v, reply=[%v]\n", rf.me, index, reply)
+				voteCh <- reply.VoteGranted
 				serverTerms <- reply.Term
 			} else {
-				fmt.Printf("%v do not receive vote from %v, reply=[%v]\n", rf.me, index, reply)
+				// fmt.Printf("%v do not receive vote from %v, reply=[%v]\n", rf.me, index, reply)
 				voteCh <- false
 				serverTerms <- 0
 			}
@@ -861,9 +898,8 @@ func (rf *Raft) startElection() bool {
 	}
 	rf.transformTo(Candidate, rf.term+1)
 	term := rf.term
-	rf.voteAt = term
 
-	fmt.Printf("me=%v, start to election, term=%v, rf=[%v]\n", rf.me, rf, term)
+	// fmt.Printf("me=%v, start to election, term=%v, rf=[%v]\n", rf.me, rf, term)
 	rf.mu.Unlock()
 
 	agrees, maxTerm := rf.fetchVotesUntil(term, rf.agreeMin(), rf.rejectMax())
@@ -872,27 +908,27 @@ func (rf *Raft) startElection() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Printf("me=%v, term %v election done, agrees=%v, maxTerm=%v, rf=[%v] ", rf.me, term, agrees, maxTerm, rf)
+	// fmt.Printf("me=%v, term %v election done, agrees=%v, maxTerm=%v, rf=[%v] ", rf.me, term, agrees, maxTerm, rf)
 
 	if maxTerm > rf.term {
 		// find higher term
-		fmt.Printf("lose, find higher term\n")
+		// fmt.Printf("lose, find higher term\n")
 		rf.transformTo(Follower, maxTerm)
 		return false
 	}
 
 	// term of server changed, old election invalid
 	if term != rf.term {
-		fmt.Printf("lose, term changed\n")
+		// fmt.Printf("lose, term changed\n")
 		return false
 	}
 
 	if agrees < rf.agreeMin() {
-		fmt.Printf("lose, dont get %v ticket\n", rf.agreeMin())
+		// fmt.Printf("lose, dont get %v ticket\n", rf.agreeMin())
 		return false
 	}
 
-	fmt.Printf("win\n")
+	// fmt.Printf("win\n")
 	rf.transformTo(Leader, rf.term)
 	return true
 }
@@ -910,7 +946,10 @@ func (rf *Raft) transformTo(newState RaftStateType, newTerm int) {
 			log.Fatalf("transformTo: transform to leader should have higher term")
 		}
 
+		rf.voteFor = -1
 		rf.extendTerm()
+	} else {
+		rf.voteFor = rf.me
 	}
 
 	rf.term = newTerm
@@ -968,6 +1007,8 @@ func (rf *Raft) applyLogEntry() {
 				log.Fatalf("why log was removed?")
 			}
 			rf.machine.applyLogEntry(&entry, i)
+			// FIXME:would progress run normally if abort occured here?
+			// i dont think so. some entry may apply multi times
 		}
 
 		time.Sleep(10 * time.Millisecond)

@@ -193,9 +193,31 @@ func (rl *raftLog) append(e *logEntry) int {
 	return newIndex
 }
 
+// lock outside
+// get range of term in [rl.startAt, last]
+// if index last not exist, return -1, -1
+func (rl *raftLog) equal(term int, last int) (int, int) {
+	te := -1
+	tb := -1
+
+	for i := last; rl.isIndexExist(i) && rl.entries[rl.slotId(i)].Term >= term; i-- {
+		if rl.entries[rl.slotId(i)].Term > term {
+			continue
+		}
+
+		if te == -1 {
+			te = i + 1
+		}
+
+		tb = i
+	}
+
+	return tb, te
+}
+
 // insert e after entry(index, term)
 // return false if entry(index, term) is not exist
-func (rl *raftLog) appendAt(pIndex int, pTerm int, e *logEntry) AppendStateType {
+func (rl *raftLog) appendAt(pIndex int, pTerm int, e *logEntry) (AppendStateType, ConflictInfo) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -204,14 +226,23 @@ func (rl *raftLog) appendAt(pIndex int, pTerm int, e *logEntry) AppendStateType 
 	}
 
 	if !rl.isEntryExist(&entryDescriptor{pIndex, pTerm}) {
-		// previous log entry should exist
-		return appendStatePrevNotExist
+
+		// log entry(pIndex, pTerm) may not exist or conflict with previous log entry
+		if !rl.isIndexExist(pIndex) {
+			// previous log entry is not exist
+			return appendStatePrevNotExist, ConflictInfo{-1, -1, len(rl.entries)}
+		}
+
+		// previous log entry is conflict with entry(pIndex, pTerm)
+		term := rl.entries[rl.slotId(pIndex)].Term
+		minIndex, _ := rl.equal(term, pIndex)
+		return appendStatePrevNotExist, ConflictInfo{term, minIndex, len(rl.entries)}
 	}
 
 	if rl.isEntryExist(&entryDescriptor{pIndex + 1, e.Term}) {
 		// Entry will remove valid entry if **past log entry** of current term comes.
 		// so ignore repeated log entry
-		return appendStateRepeated
+		return appendStateRepeated, ConflictInfo{}
 	}
 
 	if pIndex < rl.maxCommitedIndex {
@@ -221,7 +252,7 @@ func (rl *raftLog) appendAt(pIndex int, pTerm int, e *logEntry) AppendStateType 
 
 	rl.entries = append(rl.entries[:rl.slotId(pIndex)+1], e)
 
-	return appendStateSucc
+	return appendStateSucc, ConflictInfo{}
 }
 
 // return slot id of index
@@ -335,9 +366,17 @@ func (aep *AppendEntryArgs) String() string {
 	return fmt.Sprintf("curEntry=[%v, %v], preEntry=[%v, %v], serverTerm=%v, commited=[%v, %v]", aep.Index, aep.E.Term, aep.Index-1, aep.PreTerm, aep.Term, aep.Commited.Index, aep.Commited.Term)
 }
 
+type ConflictInfo struct {
+	Term     int // term of conflict log entry if append failed
+	MinIndex int // min index of log entry with term = XTerm if append failed
+	LogLen   int // len of peer server log
+}
+
 type AppendEntryReply struct {
 	State AppendStateType // 0:succ, 1:lower term, 2:
 	Term  int             // term of peer server
+	// Conflict interface{}
+	Conflict ConflictInfo // labgob will abort if using interface{} here for unknown reason
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
@@ -346,7 +385,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	if rf.term > args.Term {
 		// caller find higher term
-		(*reply) = AppendEntryReply{appendStateIgnore, rf.term}
+		(*reply) = AppendEntryReply{appendStateIgnore, rf.term, ConflictInfo{}}
 		return
 	}
 
@@ -361,13 +400,13 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 	if args.E.isHeartBeat() {
 		// heartbeat message
-		(*reply) = AppendEntryReply{appendStateSucc, rf.term}
+		(*reply) = AppendEntryReply{appendStateSucc, rf.term, ConflictInfo{}}
 		return
 	}
 
 	// append entry at specific location
-	state := rf.log.appendAt(args.Index-1, args.PreTerm, &args.E)
-	(*reply) = AppendEntryReply{state, rf.term}
+	state, conflict := rf.log.appendAt(args.Index-1, args.PreTerm, &args.E)
+	(*reply) = AppendEntryReply{state, rf.term, conflict}
 }
 
 // save Raft's persistent state to stable storage,
@@ -503,7 +542,6 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 		}
 
 		if rf.peers[id].Call("Raft.AppendEntries", &args, &reply) {
-			fmt.Printf("me=%v, call Raft.AppendEntries succ, args=[%v], reply=[%v]\n", rf.me, args, reply)
 			break
 		}
 		// overtime, retry until term changed
@@ -518,7 +556,6 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 	case appendStateRepeated:
 		return eIndex + 1
 	case appendStateIgnore:
-
 		rf.mu.Lock()
 		if rf.term < reply.Term {
 			// find higher term
@@ -533,7 +570,31 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 		if eIndex == 1 {
 			log.Fatalf("why append the first log entry failed?")
 		}
-		return eIndex - 1
+
+		// optimize, skip more than one log entry if previous log entry is not exist.
+		// compare pre and conflict log entry,
+
+		if eIndex-1 >= reply.Conflict.LogLen {
+			// follower log entry with preIndex is not exist, send log entry with index=conflict.LogLen
+			return reply.Conflict.LogLen
+		}
+
+		if reply.Conflict.MinIndex > eIndex-1 || reply.Conflict.MinIndex <= 0 || reply.Conflict.Term <= 0 {
+			// boundary check
+			log.Fatalf("copyEntryTo: copy may would not stop")
+		}
+
+		// suppose that log entries in current server whose index in [b, e) have same term which is conflict.Term
+		// choose min(b, conflict.MinIndex) as nextSendIndex if b != e, else choose conflict.MinIndex
+		rf.log.mu.RLock()
+		b, _ := rf.log.equal(reply.Conflict.Term, eIndex-1)
+		rf.log.mu.RUnlock()
+
+		if b == -1 || reply.Conflict.MinIndex < b {
+			return reply.Conflict.MinIndex
+		}
+
+		return b
 	default:
 		log.Fatalf("invalid appendState:%v", reply.State)
 		return -1
@@ -542,8 +603,6 @@ func (rf *Raft) copyEntryTo(id int, thisTerm int, eIndex int, entry *logEntry, s
 
 // loop to copy entry to server(id) until new term
 func (rf *Raft) copyWorker(id int, thisTerm int, nextSend int, succEntryCh chan entryDescriptor) {
-	fmt.Printf("me=%v, create worker, id=%v, thisTerm:%v, nextSend=%v\n", rf.me, id, thisTerm, nextSend)
-
 	for {
 		if thisTerm != rf.getTerm() {
 			// term changed, thread of sending request changed, current thread should exit
@@ -561,9 +620,6 @@ func (rf *Raft) copyWorker(id int, thisTerm int, nextSend int, succEntryCh chan 
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-
-		// test
-		fmt.Printf("me=%v, copy entry to peer(%v), entry=%v\n", rf.me, id, entry)
 
 		nextSend = rf.copyEntryTo(id, thisTerm, nextSend, &entry, succEntryCh)
 	}
@@ -585,8 +641,6 @@ func (rf *Raft) copyEntry(thisTerm int) {
 	cnts := make(map[int]int)
 	exitCnt := 0
 
-	fmt.Printf("me=%v, copyEntry, peersTotal=%v nextSend=%v\n", rf.me, peersTotal, nextSend)
-
 	// one thread per peer server to send log entry
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -599,7 +653,6 @@ func (rf *Raft) copyEntry(thisTerm int) {
 	for {
 		if exitCnt == peersTotal {
 			// exit when all worker exit, a woker will exit if it detect term changed
-			fmt.Printf("me=%v, all worker done\n", rf.me)
 			return
 		}
 
@@ -617,8 +670,6 @@ func (rf *Raft) copyEntry(thisTerm int) {
 		}
 
 		cnts[ed.Index] = cnts[ed.Index] + 1
-
-		fmt.Printf("me=%v, %v send successfully, cnts=%v\n", rf.me, ed.Index, cnts)
 
 		if cnts[ed.Index] == rf.agreeMin()-1 {
 			if ed.Term == thisTerm {

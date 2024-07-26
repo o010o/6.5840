@@ -277,11 +277,34 @@ type Raft struct {
 	// state a Raft server must maintain.
 }
 
-func (rf *Raft) getTerm() int {
+func (rf *Raft) curTermLock() int {
 	rf.lock()
 	defer rf.unlock()
 
 	return rf.term
+}
+
+func (rf *Raft) curTerm() int {
+	return rf.term
+}
+
+func (rf *Raft) setTerm(term int) {
+	rf.term = term
+}
+
+func (rf *Raft) curState() RaftStateType {
+	return rf.state
+}
+
+func (rf *Raft) curStateLock() RaftStateType {
+	rf.lock()
+	defer rf.unlock()
+
+	return rf.curState()
+}
+
+func (rf *Raft) setState(state RaftStateType) {
+	rf.state = state
 }
 
 func (rf *Raft) lock() {
@@ -296,7 +319,7 @@ func (rf *Raft) updateCommited(thisTerm int) {
 	rf.lock()
 	defer rf.unlock()
 
-	if thisTerm != rf.term {
+	if thisTerm != rf.curTerm() {
 		return
 	}
 
@@ -306,23 +329,23 @@ func (rf *Raft) updateCommited(thisTerm int) {
 
 	sort.Ints(matchIndex)
 	// update commited log entry
-	if ed, _ := rf.log.getED(matchIndex[l-rf.agreeMin()]); ed.Term == rf.term {
+	if ed, _ := rf.log.getED(matchIndex[l-rf.agreeMin()]); ed.Term == rf.curTerm() {
 		ok := rf.log.advanceCommited(ed.Index)
 		if ok && debug {
-			log.Printf("me=%v, term %v commied %v", rf.me, rf.term, ed)
+			log.Printf("me=%v, term %v commied %v", rf.me, rf.curTerm(), ed)
 		}
 	}
 }
 
 func (rf *Raft) String() string {
-	return fmt.Sprintf("me:%v, term:%v, state:%v", rf.me, rf.term, rf.state)
+	return fmt.Sprintf("me:%v, term:%v, state:%v", rf.me, rf.curTerm(), rf.state)
 }
 
 func (rf *Raft) construct(applyCh chan ApplyMsg) {
 	rf.sendEntryInfo.construct(len(rf.peers))
-	rf.term = 0
-	rf.voteFor = voteForNone
-	rf.state = Follower
+	rf.setTerm(0)
+	rf.resetVoteFor()
+	rf.setState(Follower)
 	rf.curTimeMiliSecs = 0
 	rf.resetElectTimer(0)
 
@@ -337,14 +360,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.unlock()
 
 	// Your code here (3A).
-	return rf.term, rf.state == Leader
-}
-
-func (rf *Raft) GetRaftState() RaftStateType {
-	rf.lock()
-	defer rf.unlock()
-
-	return rf.state
+	return rf.curTerm(), rf.curState() == Leader
 }
 
 //-------------------------------- Raft -------------------------------------
@@ -382,8 +398,8 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.lock()
 	defer rf.unlock()
 
-	if rf.term > args.Term {
-		(*reply) = AppendEntryReply{appendStateIgnore, rf.term, ConflictInfo{}}
+	if rf.curTerm() > args.Term {
+		(*reply) = AppendEntryReply{appendStateIgnore, rf.curTerm(), ConflictInfo{}}
 		return
 	}
 
@@ -409,7 +425,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.persist()
 	}
 
-	(*reply) = AppendEntryReply{state, rf.term, conflict}
+	(*reply) = AppendEntryReply{state, rf.curTerm(), conflict}
 }
 
 // save Raft's persistent state to stable storage,
@@ -432,7 +448,7 @@ func (rf *Raft) persist() {
 	// persist before return response to server!
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.term)
+	e.Encode(rf.curTerm())
 	e.Encode(rf.voteFor)
 
 	e.Encode(len(rf.log.entries))
@@ -477,8 +493,8 @@ func (rf *Raft) readPersist(data []byte) {
 
 		log.Fatalf("readPersist: error decode")
 	} else {
-		rf.term = term
-		rf.voteFor = voteFor
+		rf.setTerm(term)
+		rf.voteForLeader(voteFor)
 	}
 
 	var entriesLen int
@@ -527,6 +543,14 @@ func (rf *Raft) voteForLeader(id int) {
 	rf.voteFor = id
 }
 
+func (rf *Raft) voteForWho() int {
+	return rf.voteFor
+}
+
+func (rf *Raft) resetVoteFor() {
+	rf.voteFor = voteForNone
+}
+
 func (rf *Raft) voteForPeer(args *RequestVoteArgs) bool {
 	// election restrict. To ensure that new leader have all commited log entry.
 	latest := rf.log.getLatestED()
@@ -538,7 +562,7 @@ func (rf *Raft) voteForPeer(args *RequestVoteArgs) bool {
 		return false
 	}
 
-	if rf.voteFor != voteForNone && rf.voteFor != args.CandidateId {
+	if rf.voteForWho() != voteForNone && rf.voteForWho() != args.CandidateId {
 		if debug {
 			log.Printf("%v --[%v]--> %v, reject vote, current server had vote for %v", rf.me, args.Term, args.CandidateId, rf.voteFor)
 		}
@@ -552,12 +576,11 @@ func (rf *Raft) voteForPeer(args *RequestVoteArgs) bool {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.lock()
 	defer rf.unlock()
-	// Your code here (3A, 3B).
 
-	old := rf.term
+	old := rf.curTerm()
 
 	// ignore lower term
-	if args.Term < rf.term {
+	if args.Term < rf.curTerm() {
 		*reply = RequestVoteReply{false, old}
 		return
 	}
@@ -584,7 +607,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) lowerThan(term int) bool {
-	if rf.term < term {
+	if rf.curTerm() < term {
 		rf.transToFollower(term)
 		return true
 	}
@@ -697,49 +720,13 @@ func (rf *Raft) sendHeartBeat(thisTerm int) {
 	rf.recordHeartbeat()
 }
 
-// func (rf *Raft) sendEntries(thisTerm int) {
-// 	// Send a empty entry after that program did not send entries for a period of time
-// 	for id := 0; id < len(rf.peers); id++ {
-// 		if id == rf.me {
-// 			continue
-// 		}
-// 		go func(id int) {
-// 			for !rf.killed() {
-// 				if rf.getTerm() != thisTerm || rf.GetRaftState() != Leader {
-// 					return
-// 				}
-// 				// FIXME: sometimes replies would be delayed for a long time,
-// 				//        so the consenus is too slow.
-// 				//        Try to do something!!!
-
-// 				pre, entries, err := rf.log.entriesAfter(rf.sendEntryInfo.getNext(id) - 1)
-// 				if err != nil {
-// 					log.Fatalf("sendEntries: pre entry should exist")
-// 				}
-
-// 				if len(entries) == 0 {
-// 					time.Sleep(time.Duration(tickMilisec) * time.Millisecond)
-// 					continue
-// 				}
-
-// 				// TODO: send entries asynchronous
-// 				// Because sending entries may be delaied by unknown reason, but heartbeat can be received normal.
-// 				args := AppendEntryArgs{rf.me, entries, pre, thisTerm, rf.log.getMaxCommitedIndex()}
-
-//					// resend if this call overtime
-//					rf.sendEntriesTo(id, &args)
-//				}
-//			}(id)
-//		}
-//	}
-
 // copy log entry to all other server
 func (rf *Raft) sendEntries(thisTerm int) {
-	if rf.getTerm() != thisTerm || rf.GetRaftState() != Leader {
+	if rf.curTermLock() != thisTerm || rf.curStateLock() != Leader {
 		return
 	}
 
-	// TODO: send entries asynchronous
+	// Send entries asynchronous
 	// Because sending entries may be delaied by unknown reason, but heartbeat can be received normal.
 	for id := 0; id < len(rf.peers); id++ {
 		if id == rf.me {
@@ -747,21 +734,12 @@ func (rf *Raft) sendEntries(thisTerm int) {
 		}
 
 		go func(id int) {
-			// FIXME: sometimes replies would be delayed for a long time,
-			//        so the consenus is too slow.
-			//        Try to do something!!!
-
 			pre, entries, err := rf.log.entriesAfter(rf.sendEntryInfo.getNext(id) - 1)
 			if err != nil {
 				log.Fatalf("sendEntries: pre entry should exist")
 			}
 
 			args := AppendEntryArgs{rf.me, entries, pre, thisTerm, rf.log.getMaxCommitedIndex()}
-
-			// send entries
-			// if len(entries) == 0 {
-			// 	return
-			// }
 
 			// resend if this call overtime
 			rf.sendEntriesTo(id, &args)
@@ -820,13 +798,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.lock()
 	defer rf.unlock()
 
-	if rf.state != Leader {
+	if rf.curState() != Leader {
 		return -1, -1, false
 	}
 
-	index := rf.append(rf.term, command)
+	index := rf.append(rf.curTerm(), command)
 
-	return index, rf.term, true
+	return index, rf.curTerm(), true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -920,7 +898,7 @@ func (rf *Raft) becomeLeader(thisTerm int) bool {
 	rf.lock()
 	defer rf.unlock()
 
-	if thisTerm != rf.term {
+	if thisTerm != rf.curTerm() {
 		if debug {
 			log.Printf("me=%v, term %v election done, lose, term changed ", rf.me, thisTerm)
 		}
@@ -931,7 +909,7 @@ func (rf *Raft) becomeLeader(thisTerm int) bool {
 		log.Printf("me=%v, become leader, term=%v", rf.me, thisTerm)
 	}
 
-	rf.transToLeader(thisTerm)
+	rf.transToLeader()
 	return true
 }
 
@@ -939,8 +917,6 @@ func (rf *Raft) becomeLeader(thisTerm int) bool {
 func (rf *Raft) startElection() {
 	// FIXME:some server could not be elected, but start election frequently.
 	// other valid candidata may elect failed because its term being changed
-
-	// TODO: ?
 	// 1. stop/defer election if receive major latest entry reject
 
 	thisTerm := rf.transToCandidate()
@@ -970,6 +946,10 @@ func (rf *Raft) resetElectTimer(t int64) {
 	atomic.StoreInt64(&rf.nextElect, ms+t)
 }
 
+func (rf *Raft) sendHeartbeatNextTick() {
+	atomic.StoreInt64(&rf.lastHeartbeat, 0)
+}
+
 func (rf *Raft) isSendHeartbeat() bool {
 	return atomic.LoadInt64(&rf.lastHeartbeat)+heartbeatInterval <= atomic.LoadInt64(&rf.curTimeMiliSecs)
 }
@@ -979,21 +959,21 @@ func (rf *Raft) isSendEntries() bool {
 }
 
 func (rf *Raft) transToFollower(newTerm int) {
-	rf.term = newTerm
-	rf.state = Follower
-	rf.voteFor = voteForNone
+	rf.setTerm(newTerm)
+	rf.setState(Follower)
+	rf.resetVoteFor()
 }
 
 func (rf *Raft) transToCandidate() int {
 	rf.lock()
 	defer rf.unlock()
-	if rf.state == Leader {
+	if rf.curState() == Leader {
 		return -1
 	}
 
-	rf.state = Candidate
+	rf.setState(Candidate)
 
-	rf.term = rf.term + 1
+	rf.setTerm(rf.curTerm() + 1)
 
 	rf.voteForLeader(rf.me)
 
@@ -1002,20 +982,18 @@ func (rf *Raft) transToCandidate() int {
 	rf.persist()
 
 	if debug {
-		log.Printf("me=%v, term %v election start, time=%v", rf.me, rf.term, atomic.LoadInt64(&rf.curTimeMiliSecs))
+		log.Printf("me=%v, term %v election start, time=%v", rf.me, rf.curTerm(), atomic.LoadInt64(&rf.curTimeMiliSecs))
 	}
 
-	return rf.term
+	return rf.curTerm()
 }
 
-func (rf *Raft) transToLeader(term int) {
-	rf.state = Leader
+func (rf *Raft) transToLeader() {
+	rf.setState(Leader)
 	latestIndex := rf.log.getLatestED().Index
 	rf.sendEntryInfo.initialize(latestIndex+1, atomic.LoadInt64(&rf.curTimeMiliSecs))
 
-	atomic.StoreInt64(&rf.lastSendEntries, 0)
-
-	// go rf.sendEntries(term)
+	rf.sendHeartbeatNextTick()
 }
 
 func (rf *Raft) nextTick() {
@@ -1031,7 +1009,7 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
 
-		switch rf.state {
+		switch rf.curState() {
 		case Follower:
 			if rf.isStartElection() {
 				go rf.startElection()
@@ -1041,12 +1019,12 @@ func (rf *Raft) ticker() {
 				go rf.startElection()
 			}
 		case Leader:
-			go rf.updateCommited(rf.term)
+			go rf.updateCommited(rf.curTerm())
 			if rf.isSendHeartbeat() {
-				go rf.sendHeartBeat(rf.term)
+				go rf.sendHeartBeat(rf.curTerm())
 			}
 			if rf.isSendEntries() {
-				go rf.sendEntries(rf.term)
+				go rf.sendEntries(rf.curTerm())
 			}
 		}
 		rf.mu.Unlock()

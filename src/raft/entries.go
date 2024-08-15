@@ -1,7 +1,7 @@
 package raft
 
 import (
-	"errors"
+	"fmt"
 	"log"
 	"sync"
 )
@@ -12,80 +12,208 @@ type logEntry struct {
 	Command interface{}
 }
 
+type snapshot struct {
+	Data []byte
+	Last entryDescriptor
+}
+
+func (ss *snapshot) clone() (entryDescriptor, []byte) {
+	data := make([]byte, len(ss.Data))
+	copy(data, ss.Data)
+
+	return ss.Last, data
+}
+
+func (ss *snapshot) getLast() entryDescriptor {
+	return ss.Last
+}
+
 type raftLog struct {
-	mu sync.RWMutex
-	// apply may block because of net, so we have to try apply log entry until success. So just send log entry periodically.
+	mu               sync.RWMutex
 	entries          []logEntry // pointer to content of log entry
 	maxCommitedIndex int        // biggest index which can apply to state machine safely.
+	snapshot         snapshot   // snpashot
 }
 
-func min(lhs int, rhs int) int {
-	if lhs < rhs {
-		return lhs
+func (rl *raftLog) String() string {
+	var str string
+
+	if len(rl.entries) > 0 {
+		str += fmt.Sprintf("len=%v, begin=%v, end=%v, ", len(rl.entries), rl.entries[0], rl.entries[len(rl.entries)-1])
+	} else {
+		str += string("len=0,")
 	}
-	return rhs
+
+	str += fmt.Sprintf("maxCommitedIndex=%v, snapshotLast=%v", rl.maxCommitedIndex, rl.snapshot.getLast())
+	return str
 }
 
-func max(lhs int, rhs int) int {
-	if lhs > rhs {
-		return lhs
-	}
-	return rhs
-}
-
-func (rf *raftLog) lock() {
-	rf.mu.Lock()
-}
-
-func (rf *raftLog) unlock() {
-	rf.mu.Unlock()
-}
-
-func (rf *raftLog) rLock() {
-	rf.mu.RLock()
-}
-
-func (rf *raftLog) rUnLock() {
-	rf.mu.RUnlock()
-}
-
-func (rf *raftLog) len() int {
-	rf.rLock()
-	defer rf.rUnLock()
-	return len(rf.entries)
-}
-
-func (rl *raftLog) advanceCommited(commitedIndex int) bool {
+func (rl *raftLog) replaceSnapshotLock(last entryDescriptor, data []byte) {
 	rl.lock()
 	defer rl.unlock()
 
+	rl.replaceSnapshot(last, data)
+}
+
+func (rl *raftLog) replaceSnapshot(last entryDescriptor, data []byte) {
+	rl.snapshot.Last = last
+	rl.snapshot.Data = data
+
+	rl.advanceCommited(last.Index)
+}
+
+func (rl *raftLog) lock() {
+	rl.mu.Lock()
+}
+
+func (rl *raftLog) unlock() {
+	rl.mu.Unlock()
+}
+
+func (rl *raftLog) rLock() {
+	rl.mu.RLock()
+}
+
+func (rl *raftLog) rUnLock() {
+	rl.mu.RUnlock()
+}
+
+func (rl *raftLog) getSnapshotLast() entryDescriptor {
+	return rl.snapshot.Last
+}
+
+func (rl *raftLog) getSnapshotLastLock() entryDescriptor {
+	rl.rLock()
+	defer rl.rUnLock()
+
+	return rl.getSnapshotLast()
+}
+
+func (rl *raftLog) getMaxEntryIndex() int {
+	if len(rl.entries) != 0 {
+		// the log may remain entry in snapshot for failure in our implmentent
+		return max(rl.entries[len(rl.entries)-1].Index, rl.snapshot.getLast().Index)
+	}
+
+	return rl.snapshot.getLast().Index
+}
+
+func (rl *raftLog) getMaxEntryIndexLock() int {
+	rl.lock()
+	defer rl.unlock()
+	return rl.getMaxEntryIndex()
+}
+
+func (rl *raftLog) advanceCommited(commitedIndex int) bool {
 	if commitedIndex <= rl.maxCommitedIndex {
 		return false
 	}
 
 	rl.maxCommitedIndex = commitedIndex
 
-	if !rl.isIndexExist(rl.maxCommitedIndex) {
-		log.Fatalf("advanceCommited: maxCommitedIndex not exist")
+	if !rl.isIndexInSnapshot(rl.maxCommitedIndex) && !rl.isIndexInLog(rl.maxCommitedIndex) {
+		panic("advanceCommitedLock: maxCommitedIndex not exist")
 	}
 
 	return true
 }
 
+func (rl *raftLog) advanceCommitedLock(commitedIndex int) bool {
+	rl.lock()
+	defer rl.unlock()
+
+	return rl.advanceCommited(commitedIndex)
+}
+
+func (rl *raftLog) getEntry(index int) (pointerToEntry *logEntry, isInSnapshot bool, err error) {
+	if index < 0 {
+		log.Fatalf("getEntry: invalid index %v", index)
+	}
+
+	if rl.isIndexInSnapshot(index) {
+		return nil, true, nil
+	}
+
+	if rl.isIndexInLog(index) {
+		return &rl.entries[rl.slotId(index)], false, nil
+	}
+
+	// entry is not exist
+	return nil, false, fmt.Errorf("getEntry: invalid index %v, maxIndex=%v", index, rl.getMaxEntryIndex())
+}
+
+func (rl *raftLog) zeroEntryED() entryDescriptor {
+	return entryDescriptor{0, 0}
+}
+
 func (rl *raftLog) getED(index int) (entryDescriptor, error) {
+	if index == 0 {
+		return rl.zeroEntryED(), nil
+	}
+
+	last := rl.snapshot.getLast()
+	if index == last.Index {
+		return entryDescriptor{index, last.Term}, nil
+	}
+
+	e, _, err := rl.getEntry(index)
+	if err != nil {
+		return entryDescriptor{-1, -1}, fmt.Errorf("index %v is not exist, maxEntryIndex=%v", index, rl.getMaxEntryIndex())
+	}
+	return entryDescriptor{index, e.Term}, nil
+}
+
+func (rl *raftLog) equalLock(term int, last int) (int, int) {
+	rl.lock()
+	defer rl.unlock()
+
+	return rl.equal(term, last)
+}
+
+// lock outside
+// get range of term in [rl.startAt, last]
+// if index last not exist, return -1, -1
+func (rl *raftLog) equal(term int, last int) (int, int) {
+	if last <= 0 || last > rl.getMaxEntryIndex() {
+		log.Fatalf("equal: invalid last %v", last)
+	}
+
+	if rl.isIndexInSnapshot(last) {
+		return -1, -1
+	}
+
+	te := -1
+	tb := -1
+	// find entry whose has term before last
+	for i := last; i > 0; i-- {
+		e, inSnapshot, err := rl.getEntry(i)
+		if err != nil || inSnapshot || e.Term < term {
+			break
+		}
+
+		if e.Term == term {
+			if te == -1 {
+				te = i + 1
+			}
+
+			tb = i
+		}
+	}
+
+	return tb, te
+}
+
+func (rl *raftLog) getEDLock(index int) (entryDescriptor, error) {
 	rl.rLock()
 	defer rl.rUnLock()
 
-	if !rl.isIndexExist(index) {
-		return entryDescriptor{-1, -1}, errors.New("index not exist")
-	}
-
-	return entryDescriptor{index, rl.entries[rl.slotId(index)].Term}, nil
+	return rl.getED(index)
 }
 
 func (rl *raftLog) construct() {
-	rl.entries = make([]logEntry, 1)
-	rl.entries[0] = logEntry{0, 0, nil}
+	rl.entries = make([]logEntry, 0)
+	rl.snapshot.Last = entryDescriptor{0, 0}
+	rl.snapshot.Data = nil
 	rl.maxCommitedIndex = 0
 }
 
@@ -96,127 +224,209 @@ func (rl *raftLog) getMaxCommitedIndex() int {
 	return rl.maxCommitedIndex
 }
 
-func (rl *raftLog) getMaxCommitedED() entryDescriptor {
-	rl.rLock()
-	defer rl.rUnLock()
+func (rl *raftLog) appendNew(entries []logEntry) int {
+	if len(entries) == 0 {
+		return 0
+	}
 
-	return entryDescriptor{rl.maxCommitedIndex, rl.entries[rl.slotId(rl.maxCommitedIndex)].Term}
+	if entries[0].Index < 1 || entries[0].Index > rl.getMaxEntryIndex()+1 {
+		return 0
+	}
+
+	if entries[0].Index == rl.getMaxEntryIndex()+1 {
+		rl.entries = append(rl.entries, entries...)
+		return len(entries)
+	}
+
+	var firstDiff int
+	for firstDiff = 0; firstDiff < len(entries); firstDiff++ {
+		e, inSnapshot, err := rl.getEntry(entries[firstDiff].Index)
+		if err != nil {
+			// local log does not have entry(entries[firstDiff].Index)
+			break
+		}
+		if !inSnapshot && e.Term != entries[firstDiff].Term {
+			// find first conflict log entry
+			break
+		}
+	}
+
+	if firstDiff >= len(entries) {
+		// no new entry
+		return 0
+	}
+
+	if rl.isIndexInLog(entries[firstDiff].Index) {
+		rl.removeAfterAnd(entries[firstDiff].Index)
+	}
+
+	rl.entries = append(rl.entries, entries[firstDiff:]...)
+
+	return len(entries) - firstDiff
+}
+
+func (rl *raftLog) appendAt(pre entryDescriptor, entries []logEntry) (state AppendStateType, newAppendN int, conflict ConflictInfo) {
+	// lock raft outside
+	rl.lock()
+	defer rl.unlock()
+
+	if pre.Index < 0 {
+		log.Fatalf("appendAt: pIndex should greater or equal than 0")
+	}
+
+	if pre.Index == 0 {
+		return appendStateSucc, rl.appendNew(entries), ConflictInfo{-1, -1, rl.getMaxEntryIndex() + 1}
+	}
+
+	if rl.isIndexInSnapshot(pre.Index) {
+		return appendStateSucc, rl.appendNew(entries), ConflictInfo{-1, -1, rl.getMaxEntryIndex() + 1}
+	}
+
+	if rl.isIndexInLog(pre.Index) {
+		e, _, _ := rl.getEntry(pre.Index)
+		if e.Term != pre.Term {
+			// follower does not have pre, do not append entries
+			minIndex, _ := rl.equal(e.Term, pre.Index)
+			return appendStatePrevConflict, 0, ConflictInfo{e.Term, minIndex, rl.getMaxEntryIndex() + 1}
+		}
+		return appendStateSucc, rl.appendNew(entries), ConflictInfo{-1, -1, rl.getMaxEntryIndex() + 1}
+	}
+
+	return appendStatePrevNotExist, 0, ConflictInfo{-1, -1, rl.getMaxEntryIndex() + 1}
+}
+
+func (rl *raftLog) append(term int, command interface{}) int {
+	// lock raft outside
+	rl.lock()
+	defer rl.unlock()
+
+	newIndex := rl.getMaxEntryIndex() + 1
+
+	rl.entries = append(rl.entries, logEntry{newIndex, term, command})
+
+	return newIndex
 }
 
 func (rl *raftLog) getLatestED() entryDescriptor {
 	rl.rLock()
 	defer rl.rUnLock()
 
-	return entryDescriptor{rl.entries[len(rl.entries)-1].Index, rl.entries[len(rl.entries)-1].Term}
+	ed, err := rl.getED(rl.getMaxEntryIndex())
+	if err != nil {
+		log.Fatalf("getLatestED: %v", err.Error())
+	}
+	return ed
 }
 
-func (rl *raftLog) isIndexExist(index int) bool {
+func (rl *raftLog) isIndexInSnapshotLock(index int) bool {
+	rl.rLock()
+	defer rl.rUnLock()
+
+	return rl.isIndexInSnapshot(index)
+}
+
+func (rl *raftLog) isIndexInSnapshot(index int) bool {
+	return 0 < index && index <= rl.snapshot.Last.Index
+}
+
+func (rl *raftLog) isIndexInLog(index int) bool {
 	if len(rl.entries) == 0 {
 		return false
 	}
 
-	if index < rl.entries[0].Index || index > rl.entries[len(rl.entries)-1].Index {
-		return false
-	}
-
-	return true
-}
-
-func (rl *raftLog) isEntryExist(entry *entryDescriptor) bool {
-	if !rl.isIndexExist(entry.Index) {
-		return false
-	}
-
-	return rl.entries[rl.slotId(entry.Index)].Term == entry.Term
+	return rl.entries[0].Index <= index && index <= rl.entries[len(rl.entries)-1].Index
 }
 
 // return slot id of index
 func (rl *raftLog) slotId(index int) int {
+	// FIXME: log entry in snapshot could exist
+
 	if len(rl.entries) == 0 {
-		return -1
+		panic("log is empty")
 	}
 
-	// used before lock!
-	return index - rl.entries[0].Index
+	if rl.entries[0].Index <= index && index <= rl.entries[len(rl.entries)-1].Index {
+		return index - rl.entries[0].Index
+	}
+
+	panic(fmt.Sprintf("slotId: invalid index, index=%v, maxEntryIndex=%v, snapshot last=%v", index, rl.getMaxEntryIndex(), rl.getSnapshotLast()))
 }
 
-func (rl *raftLog) getDiffSuffix(entries []logEntry) int {
-	if len(entries) == 0 {
-		log.Fatalf("getDiffSuffix: len of entries is 0")
-	}
+func (rl *raftLog) clearLog() {
+	rl.lock()
+	defer rl.unlock()
 
-	i1 := rl.slotId(entries[0].Index)
-	i2 := 0
-
-	for ; i1 < len(rl.entries) && i2 < len(entries); i1, i2 = i1+1, i2+1 {
-		if rl.entries[i1].Term != entries[i2].Term {
-			break
-		}
-	}
-
-	if i2 == len(entries) {
-		return entries[i2-1].Index + 1
-	}
-
-	return entries[i2].Index
+	rl.entries = make([]logEntry, 0)
 }
 
-// return slice of entries, dont modify this slice
-func (rl *raftLog) entriesAfter(index int, numsOpt ...int) (entryDescriptor, []logEntry, error) {
+func (rl *raftLog) removeBeforeAnd(index int) error {
+	rl.lock()
+	defer rl.unlock()
+	if index == 0 {
+		panic("removeBeforeAnd: why index is zero")
+	}
+
+	if !rl.isIndexInLog(index) {
+		return fmt.Errorf("removeBeforeAnd: entry before %v had been removed, raftLog=%v", index, rl)
+	}
+
+	rl.entries = rl.entries[rl.slotId(index)+1:]
+	return nil
+}
+
+func (rl *raftLog) removeAfterAnd(index int) {
+	if index <= 0 || index > rl.getMaxEntryIndex() {
+		log.Fatalf("removeAfterAnd: invalid index, index=%v", index)
+	}
+
+	if rl.isIndexInSnapshot(index) {
+		panic(fmt.Sprintf("removeAfterAnd: remove snapshot, index=%v", index))
+	}
+
+	rl.entries = rl.entries[:rl.slotId(index)]
+}
+
+func (rl *raftLog) entriesAfterAnd(index int, numsOpt ...int) (entryDescriptor, []logEntry) {
 	rl.rLock()
 	defer rl.rUnLock()
 
-	if !rl.isIndexExist(index) {
-		return entryDescriptor{-1, -1}, []logEntry{}, errors.New("invalid index")
+	if index <= 0 || index > rl.getMaxEntryIndex() || index <= rl.getSnapshotLast().Index {
+		panic(fmt.Sprintf("entriesAfterAnd: invalid index, index=%v, lastIndex=%v, snapshot last=%v", index, rl.getMaxEntryIndex(), rl.getSnapshotLast()))
 	}
 
-	if index == rl.entries[len(rl.entries)-1].Index {
-		return entryDescriptor{index, rl.entries[rl.slotId(index)].Term}, []logEntry{}, nil
-	}
-
-	nums := -1
+	nums := rl.getMaxEntryIndex() - index + 1
 	if len(numsOpt) > 0 {
-		nums = numsOpt[0]
+		if numsOpt[0] <= 0 {
+			log.Fatalf("entriesAfterAnd: nums should bigger than 0")
+		}
+		nums = min(numsOpt[0], nums)
 	}
 
-	if nums < 0 {
-		// if term maintains
-		// slice still can be used even there is new entry appends to log
-		// if term end, and this server transform to follower, and the log was truncated.
-		// slice returned can be accessed safely without segement, only the data we dont use would be changed
-		entries := make([]logEntry, len(rl.entries)-rl.slotId(index+1))
-		copy(entries, rl.entries[rl.slotId(index+1):])
-		return entryDescriptor{index, rl.entries[rl.slotId(index)].Term}, entries, nil
-	}
-
-	// fetch [index + 1, index + 1 + nums)
-	e := index + 1 + nums
-	if e > rl.entries[len(rl.entries)-1].Index+1 {
-		log.Fatalf("no enough entry to return")
+	preED, err := rl.getED(index - 1)
+	if err != nil {
+		panic("entriesAfterAnd: get pre entry descriptor failed")
 	}
 
 	entries := make([]logEntry, nums)
-	copy(entries, rl.entries[rl.slotId(index+1):rl.slotId(e)])
-	return entryDescriptor{index, rl.entries[rl.slotId(index)].Term}, entries, nil
+	sId := rl.slotId(index)
+	copy(entries, rl.entries[sId:sId+nums])
+
+	return preED, entries
 }
 
-func (rl *raftLog) checkConsistency(startIndex int) {
-	if len(rl.entries) == 0 {
-		return
-	}
+func (rl *raftLog) checkConsistency() {
+	rl.lock()
+	defer rl.unlock()
 
-	if startIndex >= 0 {
-		if rl.entries[0].Index != startIndex {
-			log.Fatalf("assertIndex: start index inconsistency")
+	if len(rl.entries) != 0 && rl.getSnapshotLast().Index != 0 {
+		if rl.entries[0].Index-1 != rl.getSnapshotLast().Index {
+			panic(fmt.Sprintf("index of first log entry:%v is not equal last index of snapshot:%v + 1 ", rl.entries[0].Index, rl.getSnapshotLast().Index))
 		}
 	}
 
 	for i := 1; i < len(rl.entries); i++ {
-		if rl.entries[i].Index != rl.entries[i-1].Index+1 {
-			log.Fatalf("assertIndex: Failed")
-		}
-		if rl.entries[i].Term < rl.entries[i-1].Term {
-			log.Fatalf("assertIndex: Failed")
+		if rl.entries[i-1].Index+1 != rl.entries[i].Index {
+			panic(fmt.Sprintf("entries[%v].Index: %v != entries[%v].Index:%v", i-1, rl.entries[i-1].Index, i, rl.entries[i].Index))
 		}
 	}
 }

@@ -7,8 +7,8 @@ import (
 
 type stateMachine struct {
 	mu      sync.RWMutex
-	applyCh chan ApplyMsg
 	applied entryDescriptor
+	applyCh chan ApplyMsg
 }
 
 func (m *stateMachine) getApplied() entryDescriptor {
@@ -24,26 +24,40 @@ func (m *stateMachine) construct(ch chan ApplyMsg) {
 	m.applied.Term = 0
 }
 
-func (m *stateMachine) applyLogEntry(e logEntry) {
+func (m *stateMachine) advanceApplied(applied *entryDescriptor) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if e.Index != m.applied.Index+1 {
-		log.Fatalf("invalid apply sequence")
+	if m.applied.getIndex() >= applied.getIndex() {
+		return false
 	}
 
-	m.applyCh <- ApplyMsg{true, e.Command, e.Index, false, []byte{}, 0, 0}
-	m.applied.Term = e.Term
-	m.applied.Index = e.Index
+	m.applied = *applied
+	return true
+}
+
+func (m *stateMachine) reset(last entryDescriptor, data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+
+	m.applyCh <- ApplyMsg{false, nil, 0, true, data, last.Term, last.Index}
+
+	m.advanceApplied(&last)
+	return true
 }
 
 func (m *stateMachine) applyLogEntries(entries []logEntry) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, entry := range entries {
-		m.applyCh <- ApplyMsg{true, entry.Command, entry.Index, false, []byte{}, 0, 0}
-		m.applied.Term = entry.Term
-		m.applied.Index = entry.Index
-	}
+		if debug {
+			log.Printf("ready to apply %v", entry)
+		}
 
+		m.applyCh <- ApplyMsg{true, entry.Command, entry.Index, false, nil, 0, 0}
+		if debug {
+			log.Printf("apply %v done", entry)
+		}
+
+		m.advanceApplied(&entryDescriptor{entry.Index, entry.Term})
+	}
 }

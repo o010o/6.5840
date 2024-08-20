@@ -18,6 +18,7 @@ type snapshot struct {
 }
 
 func (ss *snapshot) clone() (entryDescriptor, []byte) {
+	// FIXME: why dont lock?
 	data := make([]byte, len(ss.Data))
 	copy(data, ss.Data)
 
@@ -33,6 +34,16 @@ type raftLog struct {
 	entries          []logEntry // pointer to content of log entry
 	maxCommitedIndex int        // biggest index which can apply to state machine safely.
 	snapshot         snapshot   // snpashot
+}
+
+func (rl *raftLog) cloneSnapshot() (entryDescriptor, []byte) {
+	rl.rLock()
+	defer rl.rUnLock()
+
+	data := make([]byte, len(rl.snapshot.Data))
+	copy(data, rl.snapshot.Data)
+
+	return rl.snapshot.Last, data
 }
 
 func (rl *raftLog) String() string {
@@ -112,13 +123,13 @@ func (rl *raftLog) tryAdvanceCommited(commitedIndex int) bool {
 	rl.maxCommitedIndex = commitedIndex
 
 	if !rl.isIndexInSnapshot(rl.maxCommitedIndex) && !rl.isIndexInLog(rl.maxCommitedIndex) {
-		panic("trytryAdvanceCommitedLock: maxCommitedIndex not exist")
+		panic("tryAdvanceCommitedLock: maxCommitedIndex not exist")
 	}
 
 	return true
 }
 
-func (rl *raftLog) trytryAdvanceCommitedLock(commitedIndex int) bool {
+func (rl *raftLog) tryAdvanceCommitedLock(commitedIndex int) bool {
 	rl.lock()
 	defer rl.unlock()
 
@@ -330,6 +341,9 @@ func (rl *raftLog) isIndexInSnapshot(index int) bool {
 }
 
 func (rl *raftLog) isIndexInLog(index int) bool {
+	rl.lock()
+	defer rl.unlock()
+
 	if len(rl.entries) == 0 {
 		return false
 	}

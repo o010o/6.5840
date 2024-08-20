@@ -65,7 +65,7 @@ const (
 	voteForNone             int             = -1  // vote for nobody
 	applyInterval           int64           = 10  // 10 milisecond
 	heartbeatInterval       int64           = 100 // 100 milisecond
-	sendEntriesInterval     int64           = 100 //
+	sendEntriesInterval     int64           = 30  //
 	electionMin             int64           = 150 // min election overtime
 	electionMax             int64           = 400 //
 	tickMilisec             int64           = 10  // 10 milisecond one tick
@@ -228,7 +228,7 @@ func (rf *Raft) updateCommited(thisTerm int) {
 	sort.Ints(matchIndex)
 	// update commited log entry
 	if ed, _ := rf.log.getEDLock(matchIndex[l-rf.agreeMin()]); ed.Term == rf.curTerm() {
-		ok := rf.log.trytryAdvanceCommitedLock(ed.Index)
+		ok := rf.log.tryAdvanceCommitedLock(ed.Index)
 		if ok && debug {
 			log.Printf("me=%v, term %v commited %v", rf.me, rf.curTerm(), ed)
 		}
@@ -268,10 +268,6 @@ type entryDescriptor struct {
 	Term  int
 }
 
-func (e *entryDescriptor) getTerm() int {
-	return e.Term
-}
-
 func (e *entryDescriptor) getIndex() int {
 	return e.Index
 }
@@ -309,10 +305,6 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 
-	if debug && len(args.Entries) == 0 {
-		log.Printf("%v --%v--> %v, heartbeat reach, time:%v", args.LeaderId, args.Term, rf.me, atomic.LoadInt64(&rf.curTime))
-	}
-
 	rf.recordReceive()
 
 	isTermChanged := rf.increaseTerm(args.Term)
@@ -320,7 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// append entry at specific location
 	state, newN, conflict := rf.log.appendAt(args.PreEntry, args.Entries)
 	if state == appendStateSucc {
-		ok := rf.log.trytryAdvanceCommitedLock(min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
+		ok := rf.log.tryAdvanceCommitedLock(min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
 		if debug {
 			log.Printf("me=%v, append %v entry(s) at %v, new=%v", rf.me, len(args.Entries), args.PreEntry.getIndex()+1, newN)
 			if ok {
@@ -427,9 +419,6 @@ func (rf *Raft) readPersist(data []byte, snapshotData []byte) {
 	}
 
 	rf.log.replaceSnapshot(last, snapshotData)
-
-	// FIXME: necessary here?
-	// rf.machine.reset(last, snapshotData)
 }
 
 type SnapshotArgs struct {
@@ -602,14 +591,10 @@ func (rf *Raft) increaseTermLock(term int) bool {
 	return rf.increaseTerm(term)
 }
 
-func (rf *Raft) sendHeartbeatTo(id int, args *AppendEntryArgs) {
+func (rf *Raft) sendHeartbeatTo(server int, args *AppendEntryArgs) {
 	reply := AppendEntryReply{}
 
-	if debug {
-		log.Printf("%v--[%v]-->%v, send heartbeat, at %v", rf.me, args.Term, id, atomic.LoadInt64(&rf.curTime))
-	}
-
-	if ok := rf.peers[id].Call("Raft.AppendEntries", args, &reply); !ok {
+	if ok := rf.peers[server].Call("Raft.AppendEntries", args, &reply); !ok {
 		return
 	}
 
@@ -617,24 +602,22 @@ func (rf *Raft) sendHeartbeatTo(id int, args *AppendEntryArgs) {
 }
 
 // loop to copy entry to server(id) until new term
-func (rf *Raft) sendEntriesTo(server int, args *AppendEntryArgs) {
+func (rf *Raft) sendEntriesTo(server int, thisTime int64, args *AppendEntryArgs) {
 	reply := AppendEntryReply{}
 	if debug {
-		log.Printf("%v --[%v]--> %v, send entry with index %v, pre=[%v], entryLen=%v, curTime:%v", rf.me, args.Term, server, args.PreEntry.Index+1, args.PreEntry, len(args.Entries), atomic.LoadInt64(&rf.curTime))
+		log.Printf("%v --[%v]--> %v, send entry with index %v, pre=[%v], entryLen=%v, curTime:%v", rf.me, args.Term, server, args.PreEntry.Index+1, args.PreEntry, len(args.Entries), rf.getCurTime())
 	}
-
-	thisTime := atomic.LoadInt64(&rf.curTime)
 
 	if ok := rf.peers[server].Call("Raft.AppendEntries", args, &reply); !ok {
 		if debug {
-			log.Printf("%v --[%v]--> %v, overtime, pre=[%v], entryLen=%v, time=%v", rf.me, args.Term, server, args.PreEntry, len(args.Entries), atomic.LoadInt64(&rf.curTime))
+			log.Printf("%v --[%v]--> %v, overtime, pre=[%v], entryLen=%v, time=%v", rf.me, args.Term, server, args.PreEntry, len(args.Entries), rf.getCurTime())
 		}
 		return
 	}
 
 	if isTermChanged := rf.increaseTermLock(reply.Term); isTermChanged {
 		if debug {
-			log.Printf("%v --[%v]--> %v, find higher term, pre=[%v], entryLen=%v, time=%v", rf.me, args.Term, server, args.PreEntry, len(args.Entries), atomic.LoadInt64(&rf.curTime))
+			log.Printf("%v --[%v]--> %v, find higher term, pre=[%v], entryLen=%v, time=%v", rf.me, args.Term, server, args.PreEntry, len(args.Entries), rf.getCurTime())
 		}
 		return
 	}
@@ -682,15 +665,24 @@ func (rf *Raft) handleAppendEntriesReply(id int, args *AppendEntryArgs, reply *A
 	return 0, 0
 }
 
-func (rf *Raft) sendHeartBeat(thisTerm int) {
-	for id := 0; id < len(rf.peers); id++ {
-		if id == rf.me {
+func (rf *Raft) generateHeartbeatArg(thisTerm int) AppendEntryArgs {
+	return AppendEntryArgs{rf.me, []logEntry{}, rf.log.getLatestED(), thisTerm, rf.log.getMaxCommitedIndex()}
+}
+
+func (rf *Raft) sendHeartBeat(thisTerm int, thisTime int64, updateNext bool) {
+	for server := 0; server < len(rf.peers); server++ {
+		if server == rf.me {
 			continue
 		}
-		go func(id int) {
-			args := AppendEntryArgs{rf.me, []logEntry{}, rf.log.getLatestED(), thisTerm, rf.log.getMaxCommitedIndex()}
-			rf.sendHeartbeatTo(id, &args)
-		}(id)
+		go func(server int) {
+			args := rf.generateHeartbeatArg(thisTerm)
+
+			if updateNext {
+				rf.sendEntriesTo(server, thisTime, &args)
+			} else {
+				rf.sendHeartbeatTo(server, &args)
+			}
+		}(server)
 	}
 	rf.recordHeartbeat()
 }
@@ -698,7 +690,7 @@ func (rf *Raft) sendHeartBeat(thisTerm int) {
 func (rf *Raft) sendInstallSnapshot(server int, args *SnapshotArgs) {
 	reply := SnapshotReply{}
 
-	thisTime := atomic.LoadInt64(&rf.curTime)
+	thisTime := rf.getCurTime()
 
 	if ok := rf.peers[server].Call("Raft.InstallSnapshot", args, &reply); !ok {
 		return
@@ -728,7 +720,7 @@ func (rf *Raft) generateAppendEntryArg(nextSend int, thisTerm int) AppendEntryAr
 }
 
 // copy log entry to all other server
-func (rf *Raft) sendEntries(thisTerm int) {
+func (rf *Raft) sendEntries(thisTerm int, thisTime int64) {
 	if rf.curTermLock() != thisTerm || rf.curStateLock() != Leader {
 		return
 	}
@@ -739,13 +731,23 @@ func (rf *Raft) sendEntries(thisTerm int) {
 		if server == rf.me {
 			continue
 		}
-		// FIXME: The interval of sending entries is too long.
+		// TODO: when to send entries:
+		// 1. new entry
+		// 2. overtime, need to retry
+
+		// Short interval may cause unnecessary transport.
 		go func(server int) {
+			// TODO: dont send entries if there is no entry
 			nextSend := rf.sendRecord.getNext(server)
 			if nextSend == 0 {
 				panic("sendEntries: why nextSend is zero?")
 			}
 
+			if nextSend > rf.log.getMaxEntryIndexLock() {
+				return
+			}
+
+			// lock log
 			if rf.log.isIndexInSnapshotLock(nextSend) {
 				last, data := rf.log.snapshot.clone()
 				args := SnapshotArgs{rf.me, thisTerm, 0, last, data, true}
@@ -753,8 +755,11 @@ func (rf *Raft) sendEntries(thisTerm int) {
 				return
 			}
 
+			// FIXME: snapshot may changed here
 			args := rf.generateAppendEntryArg(nextSend, thisTerm)
-			rf.sendEntriesTo(server, &args)
+			// unlock log
+
+			rf.sendEntriesTo(server, thisTime, &args)
 		}(server)
 	}
 
@@ -821,7 +826,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// only modify matchIndex of current sever here
-	rf.updateMatchNext(rf.me, atomic.LoadInt64(&rf.curTime), 0, index)
+	rf.updateMatchNext(rf.me, rf.getCurTime(), 0, index)
 
 	// persist every modify? we have to persist before commit if we dont do it here.
 	rf.persist()
@@ -864,7 +869,7 @@ func (rf *Raft) handleVoteReplies(thisTerm int, replyCh chan RequestVoteReply) i
 		}
 
 		if agrees == rf.agreeMin() && once == 0 {
-			rf.becomeLeader(thisTerm)
+			rf.tryBecomeLeader(thisTerm, rf.getCurTime())
 			once = 1
 		}
 	}
@@ -909,7 +914,7 @@ func (rf *Raft) agreeMin() int {
 	return (len(rf.peers) + 1 + 1) / 2
 }
 
-func (rf *Raft) becomeLeader(thisTerm int) bool {
+func (rf *Raft) tryBecomeLeader(thisTerm int, thisTime int64) bool {
 	// transform state of server according to vote result
 	rf.lock()
 	defer rf.unlock()
@@ -926,6 +931,10 @@ func (rf *Raft) becomeLeader(thisTerm int) bool {
 	}
 
 	rf.transToLeader()
+
+	// The first heartbeat of new leader should detect if it should send entries right now.
+	go rf.sendHeartBeat(thisTerm, thisTime, true)
+
 	return true
 }
 
@@ -946,15 +955,19 @@ func (rf *Raft) startElection() {
 }
 
 func (rf *Raft) recordHeartbeat() {
-	atomic.StoreInt64(&rf.lastSendHeartbeat, atomic.LoadInt64(&rf.curTime))
+	atomic.StoreInt64(&rf.lastSendHeartbeat, rf.getCurTime())
 }
 
 func (rf *Raft) recordSendEntries() {
-	atomic.StoreInt64(&rf.lastSendEntries, atomic.LoadInt64(&rf.curTime))
+	atomic.StoreInt64(&rf.lastSendEntries, rf.getCurTime())
+}
+
+func (rf *Raft) getCurTime() int64 {
+	return atomic.LoadInt64(&rf.curTime)
 }
 
 func (rf *Raft) recordReceive() {
-	rf.resetElectTimer(atomic.LoadInt64(&rf.curTime))
+	rf.resetElectTimer(rf.getCurTime())
 }
 
 func (rf *Raft) resetElectTimer(t int64) {
@@ -967,11 +980,11 @@ func (rf *Raft) sendHeartbeatNextTick() {
 }
 
 func (rf *Raft) isSendHeartbeat() bool {
-	return atomic.LoadInt64(&rf.lastSendHeartbeat)+heartbeatInterval <= atomic.LoadInt64(&rf.curTime)
+	return atomic.LoadInt64(&rf.lastSendHeartbeat)+heartbeatInterval <= rf.getCurTime()
 }
 
 func (rf *Raft) isSendEntries() bool {
-	return atomic.LoadInt64(&rf.lastSendEntries)+sendEntriesInterval <= atomic.LoadInt64(&rf.curTime)
+	return atomic.LoadInt64(&rf.lastSendEntries)+sendEntriesInterval <= rf.getCurTime()
 }
 
 func (rf *Raft) transToFollower(newTerm int) {
@@ -993,12 +1006,12 @@ func (rf *Raft) transToCandidate() int {
 
 	rf.voteForLeader(rf.me)
 
-	rf.resetElectTimer(atomic.LoadInt64(&rf.curTime))
+	rf.resetElectTimer(rf.getCurTime())
 
 	rf.persist()
 
 	if debug {
-		log.Printf("me=%v, term %v election start, time=%v", rf.me, rf.curTerm(), atomic.LoadInt64(&rf.curTime))
+		log.Printf("me=%v, term %v election start, time=%v", rf.me, rf.curTerm(), rf.getCurTime())
 	}
 
 	return rf.curTerm()
@@ -1007,9 +1020,7 @@ func (rf *Raft) transToCandidate() int {
 func (rf *Raft) transToLeader() {
 	rf.setState(Leader)
 	latestIndex := rf.log.getLatestED().Index
-	rf.sendRecord.initialize(latestIndex+1, atomic.LoadInt64(&rf.curTime))
-
-	rf.sendHeartbeatNextTick()
+	rf.sendRecord.initialize(latestIndex+1, rf.getCurTime())
 }
 
 func (rf *Raft) nextTick() {
@@ -1036,10 +1047,10 @@ func (rf *Raft) ticker() {
 			}
 		case Leader:
 			if rf.isSendHeartbeat() {
-				go rf.sendHeartBeat(rf.curTerm())
+				go rf.sendHeartBeat(rf.curTerm(), rf.getCurTime(), false)
 			}
 			if rf.isSendEntries() {
-				go rf.sendEntries(rf.curTerm())
+				go rf.sendEntries(rf.curTerm(), rf.getCurTime())
 			}
 			go rf.updateCommited(rf.curTerm())
 		}
@@ -1064,9 +1075,13 @@ func (rf *Raft) applyLogEntry() {
 			continue
 		}
 
+		// lock log
+		// log may :
+		// 1. In snapshot
+		// 2. Not in snapshot
 		if rf.log.isIndexInSnapshotLock(maxApplied + 1) {
 			// reset state machine if log entry is in snapshot
-			last, data := rf.log.snapshot.clone()
+			last, data := rf.log.cloneSnapshot()
 			rf.machine.reset(last, data)
 			if debug {
 				log.Printf("me=%v, reset state machine, last=%v", rf.me, last)
@@ -1074,12 +1089,14 @@ func (rf *Raft) applyLogEntry() {
 			continue
 		}
 
+		// FIXME: snapshot may happened here.
 		if !rf.log.isIndexInLog(maxApplied + 1) {
 			panic("applyLogEntry: why commited entry not in log?")
 		}
 
 		// entries may not exist
 		_, entries := rf.log.entriesAfterAnd(maxApplied+1, applyNums)
+		// unlock log
 
 		rf.machine.applyLogEntries(entries)
 		if debug {

@@ -59,7 +59,7 @@ func (rl *raftLog) replaceSnapshot(last entryDescriptor, data []byte) {
 	rl.snapshot.Last = last
 	rl.snapshot.Data = data
 
-	rl.advanceCommited(last.Index)
+	rl.tryAdvanceCommited(last.Index)
 }
 
 func (rl *raftLog) lock() {
@@ -104,7 +104,7 @@ func (rl *raftLog) getMaxEntryIndexLock() int {
 	return rl.getMaxEntryIndex()
 }
 
-func (rl *raftLog) advanceCommited(commitedIndex int) bool {
+func (rl *raftLog) tryAdvanceCommited(commitedIndex int) bool {
 	if commitedIndex <= rl.maxCommitedIndex {
 		return false
 	}
@@ -112,17 +112,17 @@ func (rl *raftLog) advanceCommited(commitedIndex int) bool {
 	rl.maxCommitedIndex = commitedIndex
 
 	if !rl.isIndexInSnapshot(rl.maxCommitedIndex) && !rl.isIndexInLog(rl.maxCommitedIndex) {
-		panic("advanceCommitedLock: maxCommitedIndex not exist")
+		panic("trytryAdvanceCommitedLock: maxCommitedIndex not exist")
 	}
 
 	return true
 }
 
-func (rl *raftLog) advanceCommitedLock(commitedIndex int) bool {
+func (rl *raftLog) trytryAdvanceCommitedLock(commitedIndex int) bool {
 	rl.lock()
 	defer rl.unlock()
 
-	return rl.advanceCommited(commitedIndex)
+	return rl.tryAdvanceCommited(commitedIndex)
 }
 
 func (rl *raftLog) getEntry(index int) (pointerToEntry *logEntry, isInSnapshot bool, err error) {

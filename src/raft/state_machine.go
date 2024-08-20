@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"log"
 	"sync"
 )
 
@@ -49,15 +48,7 @@ func (m *stateMachine) reset(last entryDescriptor, data []byte) bool {
 
 func (m *stateMachine) applyLogEntries(entries []logEntry) {
 	for _, entry := range entries {
-		if debug {
-			log.Printf("ready to apply %v", entry)
-		}
-
 		m.applyCh <- ApplyMsg{true, entry.Command, entry.Index, false, nil, 0, 0}
-		if debug {
-			log.Printf("apply %v done", entry)
-		}
-
 		m.advanceApplied(&entryDescriptor{entry.Index, entry.Term})
 	}
 }

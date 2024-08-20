@@ -228,7 +228,7 @@ func (rf *Raft) updateCommited(thisTerm int) {
 	sort.Ints(matchIndex)
 	// update commited log entry
 	if ed, _ := rf.log.getEDLock(matchIndex[l-rf.agreeMin()]); ed.Term == rf.curTerm() {
-		ok := rf.log.advanceCommitedLock(ed.Index)
+		ok := rf.log.trytryAdvanceCommitedLock(ed.Index)
 		if ok && debug {
 			log.Printf("me=%v, term %v commited %v", rf.me, rf.curTerm(), ed)
 		}
@@ -320,7 +320,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// append entry at specific location
 	state, newN, conflict := rf.log.appendAt(args.PreEntry, args.Entries)
 	if state == appendStateSucc {
-		ok := rf.log.advanceCommitedLock(min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
+		ok := rf.log.trytryAdvanceCommitedLock(min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
 		if debug {
 			log.Printf("me=%v, append %v entry(s) at %v, new=%v", rf.me, len(args.Entries), args.PreEntry.getIndex()+1, newN)
 			if ok {
@@ -739,7 +739,7 @@ func (rf *Raft) sendEntries(thisTerm int) {
 		if server == rf.me {
 			continue
 		}
-
+		// FIXME: The interval of sending entries is too long.
 		go func(server int) {
 			nextSend := rf.sendRecord.getNext(server)
 			if nextSend == 0 {
@@ -823,6 +823,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// only modify matchIndex of current sever here
 	rf.updateMatchNext(rf.me, atomic.LoadInt64(&rf.curTime), 0, index)
 
+	// persist every modify? we have to persist before commit if we dont do it here.
 	rf.persist()
 
 	return index, rf.curTerm(), true

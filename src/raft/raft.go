@@ -123,32 +123,26 @@ func (sei *sendRecord) copyMatchIndex() []int {
 	return matchIndex
 }
 
-func (rf *Raft) updateMatchNextLock(server int, thisTime int64, nextIndex int, matchIndex int) {
-	rf.sendRecord.mu.Lock()
-	defer rf.sendRecord.mu.Unlock()
+func (sr *sendRecord) updateMatchNext(server int, thisTime int64, matchIndex, nextIndex int) bool {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
 
-	rf.updateMatchNext(server, thisTime, nextIndex, matchIndex)
-}
-
-func (rf *Raft) updateMatchNext(server int, thisTime int64, nextIndex int, matchIndex int) {
 	// do not allow older Appendentries update next
-	if thisTime <= rf.sendRecord.lastModifies[server] && rf.me != server {
-		return
+	if thisTime >= 0 && thisTime <= sr.lastModifies[server] {
+		return false
 	}
 
-	rf.sendRecord.lastModifies[server] = thisTime
+	sr.lastModifies[server] = thisTime
 
 	if nextIndex > 0 {
-		rf.sendRecord.nextIndex[server] = nextIndex
+		sr.nextIndex[server] = nextIndex
 	}
 
 	if matchIndex > 0 {
-		rf.sendRecord.matchIndex[server] = matchIndex
+		sr.matchIndex[server] = matchIndex
 	}
 
-	if debug {
-		log.Printf("%v ----> %v, next=%v, match=%v", rf.me, server, rf.sendRecord.nextIndex[server], rf.sendRecord.matchIndex[server])
-	}
+	return true
 }
 
 //-------------------------------- Raft -------------------------------------
@@ -216,22 +210,26 @@ func (rf *Raft) unlock() {
 func (rf *Raft) updateCommited(thisTerm int) {
 	rf.lock()
 	defer rf.unlock()
+	// read index of successful sending, find out the index at which consensus is reached
+
 	// TODO: optimize, could not lock all
 	if thisTerm != rf.curTerm() {
 		return
 	}
 
-	l := len(rf.peers)
-
 	matchIndex := rf.sendRecord.copyMatchIndex()
 
 	sort.Ints(matchIndex)
+
+	ed, _ := rf.log.getEDLock(matchIndex[len(rf.peers)-rf.agreeMin()])
+	if ed.Term != rf.curTerm() {
+		return
+	}
+
 	// update commited log entry
-	if ed, _ := rf.log.getEDLock(matchIndex[l-rf.agreeMin()]); ed.Term == rf.curTerm() {
-		ok := rf.log.tryAdvanceCommitedLock(ed.Index)
-		if ok && debug {
-			log.Printf("me=%v, term %v commited %v", rf.me, rf.curTerm(), ed)
-		}
+	ok := rf.log.commit(ed.Index)
+	if ok && debug {
+		log.Printf("me=%v, term %v commited %v", rf.me, rf.curTerm(), ed)
 	}
 }
 
@@ -312,11 +310,11 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// append entry at specific location
 	state, newN, conflict := rf.log.appendAt(args.PreEntry, args.Entries)
 	if state == appendStateSucc {
-		ok := rf.log.tryAdvanceCommitedLock(min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
+		ok := rf.log.commit(min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
 		if debug {
 			log.Printf("me=%v, append %v entry(s) at %v, new=%v", rf.me, len(args.Entries), args.PreEntry.getIndex()+1, newN)
 			if ok {
-				log.Printf("me=%v, set commited=%v", rf.me, min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
+				log.Printf("me=%v, commit %v", rf.me, min(args.CommitedIndex, args.PreEntry.Index+len(args.Entries)))
 			}
 		}
 	}
@@ -355,12 +353,12 @@ func (rf *Raft) persist() {
 	defer rf.log.unlock()
 	e.Encode(len(rf.log.entries))
 	e.Encode(rf.log.entries)
-	e.Encode(rf.log.snapshot.Last)
+	e.Encode(rf.log.s.Last)
 	// e.Encode(len(rf.log.snapshot.Data))
 	// e.Encode(rf.log.snapshot.Data)
 
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, rf.log.snapshot.Data)
+	rf.persister.Save(raftstate, rf.log.s.Data)
 }
 
 // restore previously persisted state.
@@ -418,7 +416,7 @@ func (rf *Raft) readPersist(data []byte, snapshotData []byte) {
 		panic("readPersist: decode last or dataLen failed")
 	}
 
-	rf.log.replaceSnapshot(last, snapshotData)
+	rf.log.resetSnapshot(last, snapshotData)
 }
 
 type SnapshotArgs struct {
@@ -440,29 +438,10 @@ type SnapshotReply struct {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	if index <= 0 || index > rf.log.getMaxEntryIndexLock() {
-		log.Fatalf("snapshot: invalid index %v", index)
-	}
-
-	if index < rf.log.getSnapshotLastLock().Index {
-		panic("Snapshot: invalid snapshot, last index of new snapshot smaller than old's, may cause entries lost")
-	}
-
-	if index > rf.log.getMaxCommitedIndex() {
-		panic("Snapshot: invalid snapshot, index bigger than max commited index")
-	}
-
-	last, _ := rf.log.getED(index)
-	rf.log.replaceSnapshotLock(last, snapshot)
-
-	err := rf.log.removeBeforeAnd(index)
-	if err != nil {
-		log.Fatalf("snapshot: why remove failed, %v", err.Error())
-	}
-
 	if debug {
-		log.Printf("me=%v, snapshot, last=%v", rf.me, last)
+		log.Printf("me=%v, snapshot at %v", rf.me, index)
 	}
+	rf.log.snapshot(index, snapshot)
 }
 
 func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
@@ -474,21 +453,16 @@ func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {
 		return
 	}
 
-	if debug {
-		log.Printf("%v --[%v]--> %v, InstallSnapshot, newLast=%v, oldLast:%v", args.LeaderId, args.LeaderTerm, rf.me, args.SnapshotLast, rf.log.getSnapshotLastLock())
-	}
-
 	rf.increaseTerm(args.LeaderTerm)
 
-	rf.log.replaceSnapshotLock(args.SnapshotLast, args.SnapshotData)
-
-	if rf.log.isIndexInLog(args.SnapshotLast.Index) {
-		rf.log.removeBeforeAnd(args.SnapshotLast.Index)
-	} else {
-		rf.log.clearLog()
+	if debug {
+		log.Printf("%v --[%v]--> %v, install snapshot {%v}", args.LeaderId, args.LeaderTerm, rf.me, args.SnapshotLast)
 	}
 
-	rf.persist()
+	ok := rf.log.installSnapshot(args.SnapshotLast, args.SnapshotData)
+	if ok {
+		rf.persist()
+	}
 
 	// apply snopshot to stat machine
 	(*reply) = SnapshotReply{rf.curTerm()}
@@ -615,54 +589,68 @@ func (rf *Raft) sendEntriesTo(server int, thisTime int64, args *AppendEntryArgs)
 		return
 	}
 
-	if isTermChanged := rf.increaseTermLock(reply.Term); isTermChanged {
-		if debug {
-			log.Printf("%v --[%v]--> %v, find higher term, pre=[%v], entryLen=%v, time=%v", rf.me, args.Term, server, args.PreEntry, len(args.Entries), rf.getCurTime())
-		}
-		return
-	}
-
-	nextIndex, matchIndex := rf.handleAppendEntriesReply(server, args, &reply)
-
-	rf.updateMatchNextLock(server, thisTime, nextIndex, matchIndex)
+	rf.handleAppendEntriesReply(server, args, &reply, thisTime)
 }
 
-func (rf *Raft) handleAppendEntriesReply(id int, args *AppendEntryArgs, reply *AppendEntryReply) (int, int) {
+func (rf *Raft) getMatchNextFromReply(id int, args *AppendEntryArgs, reply *AppendEntryReply) (int, int) {
 	// get index of next log entry need to be sended.
 	switch reply.State {
 	case appendStateSucc:
 		if debug {
 			log.Printf("%v --[%v]--> %v, append successful", rf.me, args.Term, id)
 		}
-		return args.PreEntry.Index + 1 + len(args.Entries), args.PreEntry.Index + len(args.Entries)
+		return args.PreEntry.Index + len(args.Entries), args.PreEntry.Index + 1 + len(args.Entries)
 	case appendStatePrevNotExist:
 
 		if debug {
 			log.Printf("%v --[%v]--> %v, previous entry is not exist", rf.me, args.Term, id)
 		}
 		// follower log entry with preIndex is not exist, send log entry with index=conflict.LogLen
-		return reply.Conflict.LogLen, 0
+		return 0, reply.Conflict.LogLen
 	case appendStatePrevConflict:
 		if debug {
 			log.Printf("%v --[%v]--> %v, previous entry conflict", rf.me, args.Term, id)
 		}
+
 		// suppose that log entries in current server whose index in [b, e) have same term which is conflict.Term
 		// choose min(b, conflict.MinIndex) as nextSendIndex if b != e, else choose conflict.MinIndex
 		b, _ := rf.log.equalLock(reply.Conflict.Term, args.PreEntry.Index)
 		if b == -1 || reply.Conflict.MinIndex < b {
-			return reply.Conflict.MinIndex, 0
+			return 0, reply.Conflict.MinIndex
 		}
 
-		return b, 0
+		return 0, b
 	case appendStateIgnore:
 		if debug {
 			log.Printf("%v --[%v]--> %v, append message is ignore", rf.me, args.Term, id)
 		}
 		return 0, 0
 	default:
-		log.Fatalf("invalid appendState:%v", reply.State)
+		panic(fmt.Sprintf("invalid appendState:%v", reply.State))
 	}
-	return 0, 0
+}
+
+func (rf *Raft) handleAppendEntriesReply(server int, args *AppendEntryArgs, reply *AppendEntryReply, thisTime int64) {
+	rf.lock()
+	defer rf.unlock()
+
+	if rf.increaseTerm(reply.Term) {
+		if debug {
+			log.Printf("%v --[%v]--> %v, find higher term, pre=[%v], entryLen=%v, time=%v", rf.me, args.Term, server, args.PreEntry, len(args.Entries), rf.getCurTime())
+		}
+		return
+	}
+
+	if rf.term != args.Term {
+		return
+	}
+
+	match, next := rf.getMatchNextFromReply(server, args, reply)
+
+	ok := rf.sendRecord.updateMatchNext(server, thisTime, match, next)
+	if debug && ok {
+		log.Printf("%v ----> %v, next=%v, match=%v", rf.me, server, next, match)
+	}
 }
 
 func (rf *Raft) generateHeartbeatArg(thisTerm int) AppendEntryArgs {
@@ -700,23 +688,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *SnapshotArgs) {
 		return
 	}
 
-	rf.updateMatchNextLock(server, thisTime, args.SnapshotLast.Index+1, 0)
-}
-
-func (rf *Raft) generateAppendEntryArg(nextSend int, thisTerm int) AppendEntryArgs {
-	latest := rf.log.getLatestED()
-
-	if nextSend > latest.Index+1 {
-		panic(fmt.Sprintf("generateAppendEntryArg: nextSend %v should smaller than %v", nextSend, latest.Index+2))
-	}
-
-	if nextSend == latest.Index+1 {
-		return AppendEntryArgs{rf.me, []logEntry{}, latest, thisTerm, rf.log.getMaxCommitedIndex()}
-	}
-
-	pre, entries := rf.log.entriesAfterAnd(nextSend)
-
-	return AppendEntryArgs{rf.me, entries, pre, thisTerm, rf.log.getMaxCommitedIndex()}
+	rf.sendRecord.updateMatchNext(server, thisTime, -1, args.SnapshotLast.Index+1)
 }
 
 // copy log entry to all other server
@@ -731,35 +703,31 @@ func (rf *Raft) sendEntries(thisTerm int, thisTime int64) {
 		if server == rf.me {
 			continue
 		}
-		// TODO: when to send entries:
-		// 1. new entry
-		// 2. overtime, need to retry
 
 		// Short interval may cause unnecessary transport.
 		go func(server int) {
-			// TODO: dont send entries if there is no entry
 			nextSend := rf.sendRecord.getNext(server)
 			if nextSend == 0 {
 				panic("sendEntries: why nextSend is zero?")
 			}
 
-			if nextSend > rf.log.getMaxEntryIndexLock() {
+			//  dont send entries if there is no entry
+			if nextSend > rf.log.getLastEntryIndexLock() {
 				return
 			}
 
-			// lock log
-			if rf.log.isIndexInSnapshotLock(nextSend) {
-				last, data := rf.log.snapshot.clone()
-				args := SnapshotArgs{rf.me, thisTerm, 0, last, data, true}
+			s, p, e := rf.log.entriesAfterAnd(nextSend)
+			if s.Data != nil {
+				// send snapshot
+				args := SnapshotArgs{rf.me, thisTerm, 0, s.Last, s.Data, true}
 				rf.sendInstallSnapshot(server, &args)
-				return
 			}
 
-			// FIXME: snapshot may changed here
-			args := rf.generateAppendEntryArg(nextSend, thisTerm)
-			// unlock log
-
-			rf.sendEntriesTo(server, thisTime, &args)
+			if len(e) > 0 {
+				// send entries
+				args := AppendEntryArgs{rf.me, e, p, thisTerm, rf.log.getMaxCommitedIndex()}
+				rf.sendEntriesTo(server, thisTime, &args)
+			}
 		}(server)
 	}
 
@@ -826,7 +794,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// only modify matchIndex of current sever here
-	rf.updateMatchNext(rf.me, rf.getCurTime(), 0, index)
+	rf.sendRecord.updateMatchNext(rf.me, -1, index, -1)
 
 	// persist every modify? we have to persist before commit if we dont do it here.
 	rf.persist()
@@ -1067,7 +1035,7 @@ func (rf *Raft) applyLogEntry() {
 		maxCommitedIndex := rf.log.getMaxCommitedIndex()
 		applyNums := maxCommitedIndex - maxApplied
 		if applyNums < 0 {
-			log.Fatalf("applyLogEntry: why applied uncommited log entry?")
+			log.Fatalf("applyLogEntry: why applied uncommited log entry? maxCommitedIndex=%v, maxApplied=%v", maxCommitedIndex, maxApplied)
 		}
 
 		if applyNums == 0 {
@@ -1075,32 +1043,28 @@ func (rf *Raft) applyLogEntry() {
 			continue
 		}
 
-		// lock log
-		// log may :
-		// 1. In snapshot
-		// 2. Not in snapshot
-		if rf.log.isIndexInSnapshotLock(maxApplied + 1) {
-			// reset state machine if log entry is in snapshot
-			last, data := rf.log.cloneSnapshot()
-			rf.machine.reset(last, data)
-			if debug {
-				log.Printf("me=%v, reset state machine, last=%v", rf.me, last)
-			}
-			continue
-		}
-
-		// FIXME: snapshot may happened here.
-		if !rf.log.isIndexInLog(maxApplied + 1) {
-			panic("applyLogEntry: why commited entry not in log?")
-		}
-
-		// entries may not exist
-		_, entries := rf.log.entriesAfterAnd(maxApplied+1, applyNums)
-		// unlock log
-
-		rf.machine.applyLogEntries(entries)
 		if debug {
-			log.Printf("me=%v, apply entries, entries=%v", rf.me, entries)
+			log.Printf("me=%v, ready to apply entries, maxApplied=%v, maxCommitedIndex=%v", rf.me, maxApplied, maxCommitedIndex)
+		}
+
+		s, _, e := rf.log.entriesAfterAnd(maxApplied+1, applyNums)
+
+		if s.Data != nil {
+			// snapshot
+			rf.machine.reset(s.Last, s.Data)
+
+			if debug {
+				log.Printf("me=%v, apply snapshot, last=%v", rf.me, s.Last)
+			}
+		}
+
+		if len(e) > 0 {
+			// entries
+			rf.machine.applyLogEntries(e)
+
+			if debug {
+				log.Printf("me=%v, apply entries, entries=%v", rf.me, e)
+			}
 		}
 	}
 }

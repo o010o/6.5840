@@ -1,5 +1,7 @@
 package kvraft
 
+import "6.5840/labgob"
+
 type operationHistory struct {
 	h map[int64]int64
 }
@@ -20,4 +22,17 @@ func (oph *operationHistory) find(op *Op) bool {
 
 func (oph *operationHistory) insert(op *Op, r *execOpResult) {
 	oph.h[op.Id.ClientId] = op.Id.RequestId
+}
+
+func (oph *operationHistory) serialization(e *labgob.LabEncoder) {
+	e.Encode(oph.h)
+}
+
+func (oph *operationHistory) unSerialization(d *labgob.LabDecoder) {
+	n := make(map[int64]int64)
+	if d.Decode(&n) != nil {
+		panic("unSerialization history failed")
+	}
+
+	oph.h = n
 }

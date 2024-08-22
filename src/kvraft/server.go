@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -106,9 +107,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	DPrintf("me=%v, Get, args=%v", kv.me, args)
 
-	// TODO: detect repeated operation here?
-	// Not here. We dont know if the incoming message has ever been sent to another server.
-
 	op := Op{args.Id, OpGet, args.Key, ""}
 	ch := make(chan execOpResult, 1)
 	done := make(chan bool, 1)
@@ -134,16 +132,6 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// TODO: do not execute repeated write(Put(), Append()) request
-	// some scenarioes:
-	// 1. Client send same write request many times because it do not receive reply. Resend is done by underly transport protocol.
-	// 2. Client send same write request to another server after request had been commited. The request may execute twice at either server.
-
-	// solution:
-	// Using solution that is samilar to kvsrv, that is, record last write request, and do nothing if new request is same as the last.
-	// Still have some problem if different client have same id. There is another write request commited and reply successfully, so the repeated request would execute twice.
-	// if we record all historical write request?
-
 	DPrintf("me=%v, Put, args=%v", kv.me, args)
 
 	op := Op{args.Id, OpPut, args.Key, args.Value}
@@ -166,16 +154,6 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// handle operation one by one
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
-	// TODO: speed up!
-	// we need ensure that there are 3 ops done during one heartbeat(100ms). But our speed is 100ms per op.
-	// There may be some problem:
-	// 1. Raft slow.
-	// We can reach consenus at averge 100 ms, and the transport delay is 0~27 ms if network if reliable.
-	// I think we could not satify the request even if we could reach a consenus within 27 ms.
-	// I think the best way to optimise is by executing more operations during one consensus.
-	// No, dude. The transport delay is at most 27 ms, so there is something wrong happened to Raft that it needs 100 ms to reach consenus.
-	// 2. Server slow.
 
 	DPrintf("me=%v, Append, args=%v", kv.me, args)
 
@@ -213,14 +191,6 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-func (kv *KVServer) snapshot() {
-	// TODO: do snapshot
-}
-
-func (kv *KVServer) snapshotMonitator() {
-	// TODO: wait/loop for snapshot
-}
-
 type execOpResult struct {
 	Err    Err
 	result interface{}
@@ -247,7 +217,6 @@ func (kv *KVServer) registerTermChanged(oldTerm int, ch chan execOpResult, done 
 				return
 			case <-time.After(time.Millisecond * 100):
 			}
-
 		}
 	}()
 }
@@ -275,9 +244,6 @@ func (kv *KVServer) tryNoticeResponse(msg *raft.ApplyMsg, execResult *execOpResu
 	if notice == nil || notice.index <= 0 || notice.term <= 0 {
 		return
 	}
-
-	// TODO: Shall we notice if there is a different operation at the index sames as notice.index?
-	// NO, i think monitor the term is enough
 
 	// Notice the waiting goroutine to response if it is waiting for the current command.
 	term, isLeader := kv.rf.GetState()
@@ -307,7 +273,7 @@ func (kv *KVServer) handleCommand(msg *raft.ApplyMsg, notice *notice) {
 		return
 	}
 
-	r := kv.execOp(&op)
+	r := kv.execOp(msg.CommandIndex, &op)
 
 	kv.opHistory.insert(&op, &r)
 
@@ -316,22 +282,44 @@ func (kv *KVServer) handleCommand(msg *raft.ApplyMsg, notice *notice) {
 	}
 }
 
-func (kv *KVServer) execOp(op *Op) execOpResult {
+func (kv *KVServer) execOp(index int, op *Op) execOpResult {
 	switch op.T {
 	case OpGet:
-		value, err := kv.database.get(op.Key)
+		value, err := kv.database.get(index, op.Key)
 		if err != nil {
 			return execOpResult{ErrNoKey, nil}
 		}
 		return execOpResult{OK, value}
 	case OpPut:
-		kv.database.put(op.Key, op.Value)
+		kv.database.put(index, op.Key, op.Value)
 	case OpAppend:
-		kv.database.append(op.Key, op.Value)
+		kv.database.append(index, op.Key, op.Value)
 	default:
 		panic("execOp: unknown operation")
 	}
 	return execOpResult{OK, nil}
+}
+
+func (kv *KVServer) generateSnapshot() (int, []byte) {
+	// Snapshot should contain state machine and historical request.
+	// State machine should be saved because it will replace the removed log.
+	// And we save historical requests because we want to verify whether the resumed state machine has the request identical to a new request.
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	last := kv.database.serialization(e)
+	kv.opHistory.serialization(e)
+
+	return last, w.Bytes()
+}
+
+func (kv *KVServer) applySnapshot(msg *raft.ApplyMsg) {
+	r := bytes.NewBuffer(msg.Snapshot)
+	d := labgob.NewDecoder(r)
+
+	kv.database.unSerialization(msg.SnapshotIndex, d)
+	kv.opHistory.unSerialization(d)
 }
 
 func (kv *KVServer) fetchAndExecOp() {
@@ -345,16 +333,20 @@ func (kv *KVServer) fetchAndExecOp() {
 			}
 
 			if msg.CommandValid {
-				// TODO: detect repeated operation here
-				// Dont do anything if we receive a repeated operation
+				if kv.maxraftstate > 0 && kv.rf.RaftStateSize() > kv.maxraftstate {
+					index, data := kv.generateSnapshot()
+					// index, data := kv.database.serialization()
+					DPrintf("me=%v, execute snapshot, index=%v, size=%v, max=%v", kv.me, index, kv.rf.RaftStateSize(), kv.maxraftstate)
+
+					kv.rf.Snapshot(index, data)
+				}
 
 				kv.handleCommand(&msg, &notice)
 			} else if msg.SnapshotValid {
-				// TODO:
-				// - replace content of data using snapshot
+				DPrintf("me=%v, reset database, index=%v, term=%v", kv.me, msg.SnapshotIndex, msg.SnapshotTerm)
+				kv.applySnapshot(&msg)
 			}
 
-			// TODO: support creating new snapshot if log is too big
 		case n := <-kv.noticeCh:
 			// only allow one notice
 			notice.init(n.op, n.index, n.term, n.ch)
@@ -384,7 +376,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
-	// TODO: create a goroutine that snapshot replica state machine when raft state reach maxraftstate
 
 	//----my initialization code---
 	kv.database.construct()

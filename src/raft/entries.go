@@ -75,9 +75,8 @@ func (rl *raftLog) snapshot(index int, newSnapshot []byte) {
 
 	rl.resetSnapshot(last, newSnapshot)
 
-	err = rl.removeBeforeAnd(index)
-	if err != nil {
-		log.Fatalf("snapshot: why remove failed, %v", err.Error())
+	if rl.isIndexInLog(index) {
+		rl.removeBeforeAnd(index)
 	}
 }
 

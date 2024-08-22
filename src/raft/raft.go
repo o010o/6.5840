@@ -326,6 +326,14 @@ func (rf *Raft) AppendEntries(args *AppendEntryArgs, reply *AppendEntryReply) {
 	(*reply) = AppendEntryReply{state, rf.curTerm(), conflict}
 }
 
+func (rf *Raft) SnapshotSize() int {
+	return rf.persister.SnapshotSize()
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -438,10 +446,19 @@ type SnapshotReply struct {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	if index <= 0 {
+		return
+	}
+
 	if debug {
 		log.Printf("me=%v, snapshot at %v", rf.me, index)
 	}
 	rf.log.snapshot(index, snapshot)
+
+	rf.lock()
+	defer rf.unlock()
+
+	rf.persist()
 }
 
 func (rf *Raft) InstallSnapshot(args *SnapshotArgs, reply *SnapshotReply) {

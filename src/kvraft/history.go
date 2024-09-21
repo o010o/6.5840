@@ -20,7 +20,7 @@ func (oph *operationHistory) find(op *Op) bool {
 	return op.Id.RequestId == id
 }
 
-func (oph *operationHistory) insert(op *Op, r *execOpResult) {
+func (oph *operationHistory) insert(op *Op, r *execResult) {
 	oph.h[op.Id.ClientId] = op.Id.RequestId
 }
 

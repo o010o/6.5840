@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -17,10 +16,11 @@ import (
 type OpType int
 
 const (
-	Debug           = false
-	OpPut    OpType = 0
-	OpAppend OpType = 1
-	OpGet    OpType = 2
+	Debug                           = false
+	OpPut             OpType        = 0
+	OpAppend          OpType        = 1
+	OpGet             OpType        = 2
+	CheckTermInterval time.Duration = 100 * time.Millisecond
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -62,29 +62,34 @@ func (args *GetArgs) String() string {
 	return fmt.Sprintf("k=\"%v\"", args.Key)
 }
 
-type notice struct {
+type notify struct {
 	op    *Op
 	index int
 	term  int
-	ch    chan execOpResult
+	ch    chan *execResult
 }
 
-func (n *notice) empty() bool {
+func (n *notify) isEmpty() bool {
 	return n.index <= 0
 }
 
-func (n *notice) init(op *Op, index int, term int, ch chan execOpResult) {
+func (n *notify) init(op *Op, index int, term int, ch chan *execResult) {
 	n.op = op
 	n.index = index
 	n.term = term
 	n.ch = ch
 }
 
-func (n *notice) reset() {
+func (n *notify) reset() {
 	n.op = nil
 	n.index = -1
 	n.term = -1
 	n.ch = nil
+}
+
+type opMessage struct {
+	op       *Op
+	resultCh chan *execResult
 }
 
 type KVServer struct {
@@ -95,81 +100,64 @@ type KVServer struct {
 	dead         int32 // set by Kill()
 	maxraftstate int   // snapshot if log grows this big
 	database     KVDatabase
-	noticeCh     chan notice
+	newOpCh      chan *opMessage
 	opHistory    operationHistory
+}
+
+func (kv *KVServer) execDispatch(op *Op) (interface{}, Err) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	resultCh := make(chan *execResult, 1)
+	kv.newOpCh <- &opMessage{op, resultCh}
+
+	res := <-resultCh
+
+	return res.result, res.err
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	// handle operation one by one
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	DPrintf("me=%v, Get, args=%v", kv.me, args)
 
 	op := Op{args.Id, OpGet, args.Key, ""}
-	ch := make(chan execOpResult, 1)
-	done := make(chan bool, 1)
-
-	kv.registerOp(&op, ch, done)
-	defer kv.cancelRegisterOp(done)
-
-	// wait until
-	// - operation reach consenus and execute operation done.
-	// - leader changed
-	r := <-ch
-	reply.Err = r.Err
-	if r.Err == OK {
-		reply.Value = r.result.(string)
+	value, err := kv.execDispatch(&op)
+	if err == OK {
+		v, ok := value.(string)
+		if !ok {
+			panic("execDispatch return true with empty result")
+		}
+		*reply = GetReply{OK, v}
+	} else {
+		*reply = GetReply{err, ""}
 	}
 
-	DPrintf("me=%v, result={%v}", kv.me, &r)
+	DPrintf("me=%v, result={%v}", kv.me, value)
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	// handle operation one by one
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	DPrintf("me=%v, Put, args=%v", kv.me, args)
 
 	op := Op{args.Id, OpPut, args.Key, args.Value}
-	ch := make(chan execOpResult, 1)
-	done := make(chan bool, 1)
+	r, err := kv.execDispatch(&op)
+	*reply = PutAppendReply{err}
 
-	kv.registerOp(&op, ch, done)
-	defer kv.cancelRegisterOp(done)
-
-	// wait until
-	// - operation reach consenus and execute operation done.
-	// - leader changed
-	r := <-ch
-	reply.Err = r.Err
-	DPrintf("me=%v, result={%v}", kv.me, &r)
+	DPrintf("me=%v, result={%v}", kv.me, r)
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	// handle operation one by one
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	DPrintf("me=%v, Append, args=%v", kv.me, args)
 
 	op := Op{args.Id, OpAppend, args.Key, args.Value}
-	ch := make(chan execOpResult, 1)
-	done := make(chan bool, 1)
+	r, err := kv.execDispatch(&op)
+	*reply = PutAppendReply{err}
 
-	kv.registerOp(&op, ch, done)
-	defer kv.cancelRegisterOp(done)
-
-	// wait until
-	// - operation reach consenus and execute operation done.
-	// - leader changed
-	r := <-ch
-	reply.Err = r.Err
-	DPrintf("me=%v, result={%v}", kv.me, &r)
+	DPrintf("me=%v, result={%v}", kv.me, r)
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -191,76 +179,16 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-type execOpResult struct {
-	Err    Err
+type execResult struct {
+	err    Err
 	result interface{}
 }
 
-func (kv *execOpResult) String() string {
-	return fmt.Sprintf("Err=\"%v\", result=\"%v\"", kv.Err, kv.result)
+func (kv *execResult) String() string {
+	return fmt.Sprintf("Err=\"%v\", result=\"%v\"", kv.err, kv.result)
 }
 
-func (kv *KVServer) registerTermChanged(oldTerm int, ch chan execOpResult, done chan bool) {
-	go func() {
-		for !kv.killed() {
-			// loop until done is true or term changed
-
-			term, _ := kv.rf.GetState()
-			if oldTerm != term {
-				DPrintf("me=%v, term changed", kv.me)
-				ch <- execOpResult{ErrWrongLeader, nil}
-				return
-			}
-
-			select {
-			case <-done:
-				return
-			case <-time.After(time.Millisecond * 100):
-			}
-		}
-	}()
-}
-
-func (kv *KVServer) registerOp(op *Op, ch chan execOpResult, done chan bool) (int, int, error) {
-	index, term, isLeader := kv.rf.Start(*op)
-	if !isLeader {
-		ch <- execOpResult{ErrWrongLeader, nil}
-		return -1, -1, errors.New("registerOperation: not leader")
-	}
-
-	DPrintf("me=%v, propagate op(%v)", kv.me, op)
-
-	kv.registerTermChanged(term, ch, done)
-	kv.noticeCh <- notice{op, index, term, ch}
-
-	return index, term, nil
-}
-
-func (kv *KVServer) cancelRegisterOp(done chan bool) {
-	done <- true
-}
-
-func (kv *KVServer) tryNoticeResponse(msg *raft.ApplyMsg, execResult *execOpResult, notice *notice) {
-	if notice == nil || notice.index <= 0 || notice.term <= 0 {
-		return
-	}
-
-	// Notice the waiting goroutine to response if it is waiting for the current command.
-	term, isLeader := kv.rf.GetState()
-	if notice.index == msg.CommandIndex && notice.term == term {
-		if !isLeader {
-			panic(fmt.Sprintf("executeOps: why server is not leader at term %v", term))
-		}
-
-		notice.ch <- *execResult
-	}
-
-	if msg.CommandIndex >= notice.index {
-		notice.reset()
-	}
-}
-
-func (kv *KVServer) handleCommand(msg *raft.ApplyMsg, notice *notice) {
+func (kv *KVServer) handleCommand(msg *raft.ApplyMsg) execResult {
 	// execute command if the command is not repeated, or fetch result from history
 	op, ok := msg.Command.(Op)
 	if !ok {
@@ -269,27 +197,24 @@ func (kv *KVServer) handleCommand(msg *raft.ApplyMsg, notice *notice) {
 
 	// Sends response if write(Append(), Put()) has been executed. Re-executes read(Get()) request.
 	if op.T != OpGet && kv.opHistory.find(&op) {
-		kv.tryNoticeResponse(msg, &execOpResult{OK, nil}, notice)
-		return
+		return execResult{OK, nil}
 	}
 
 	r := kv.execOp(msg.CommandIndex, &op)
 
 	kv.opHistory.insert(&op, &r)
 
-	if !notice.empty() {
-		kv.tryNoticeResponse(msg, &r, notice)
-	}
+	return r
 }
 
-func (kv *KVServer) execOp(index int, op *Op) execOpResult {
+func (kv *KVServer) execOp(index int, op *Op) execResult {
 	switch op.T {
 	case OpGet:
 		value, err := kv.database.get(index, op.Key)
 		if err != nil {
-			return execOpResult{ErrNoKey, nil}
+			return execResult{ErrNoKey, nil}
 		}
-		return execOpResult{OK, value}
+		return execResult{OK, value}
 	case OpPut:
 		kv.database.put(index, op.Key, op.Value)
 	case OpAppend:
@@ -297,7 +222,7 @@ func (kv *KVServer) execOp(index int, op *Op) execOpResult {
 	default:
 		panic("execOp: unknown operation")
 	}
-	return execOpResult{OK, nil}
+	return execResult{OK, nil}
 }
 
 func (kv *KVServer) generateSnapshot() (int, []byte) {
@@ -322,11 +247,49 @@ func (kv *KVServer) applySnapshot(msg *raft.ApplyMsg) {
 	kv.opHistory.unSerialization(d)
 }
 
-func (kv *KVServer) fetchAndExecOp() {
-	notice := notice{}
+func (kv *KVServer) tryNotify(msg *raft.ApplyMsg, result *execResult, no *notify) {
+	if no == nil || result == nil || no.isEmpty() {
+		return
+	}
+	// notify waiting thread if
+	// 1. term changed
+	// 2. executing operation done
+	term, isLeader := kv.rf.GetState()
+	if term != no.term {
+		no.ch <- &execResult{ErrWrongLeader, nil}
+		no.reset()
+		return
+	}
+
+	if msg == nil {
+		return
+	}
+
+	if no.index == msg.CommandIndex {
+		if !isLeader {
+			panic(fmt.Sprintf("executeOps: why server is not leader at term %v", term))
+		}
+
+		no.ch <- result
+		no.reset()
+		return
+	} else if no.index < msg.CommandIndex {
+		panic("lost notify")
+	}
+}
+
+func (kv *KVServer) worker() {
+	no := notify{}
 
 	for !kv.killed() {
 		select {
+		case n := <-kv.newOpCh:
+			index, term, isLeader := kv.rf.Start(*n.op)
+			if !isLeader {
+				n.resultCh <- &execResult{ErrWrongLeader, nil}
+			} else {
+				no.init(n.op, index, term, n.resultCh)
+			}
 		case msg := <-kv.applyCh:
 			if msg.CommandValid && msg.SnapshotValid {
 				panic("executeOps: invalid apply message")
@@ -341,15 +304,14 @@ func (kv *KVServer) fetchAndExecOp() {
 					kv.rf.Snapshot(index, data)
 				}
 
-				kv.handleCommand(&msg, &notice)
+				res := kv.handleCommand(&msg)
+				kv.tryNotify(&msg, &res, &no)
 			} else if msg.SnapshotValid {
 				DPrintf("me=%v, reset database, index=%v, term=%v", kv.me, msg.SnapshotIndex, msg.SnapshotTerm)
 				kv.applySnapshot(&msg)
 			}
-
-		case n := <-kv.noticeCh:
-			// only allow one notice
-			notice.init(n.op, n.index, n.term, n.ch)
+		case <-time.After(CheckTermInterval):
+			kv.tryNotify(nil, &execResult{ErrWrongLeader, nil}, &no)
 		}
 	}
 }
@@ -380,7 +342,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	//----my initialization code---
 	kv.database.construct()
 	kv.opHistory.construct()
-	kv.noticeCh = make(chan notice, 1)
+	kv.newOpCh = make(chan *opMessage, 1)
 	//--------------------
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -389,7 +351,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	// create one goroutine to receive message from channel
-	go kv.fetchAndExecOp()
+	go kv.worker()
 
 	return kv
 }

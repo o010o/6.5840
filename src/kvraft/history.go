@@ -25,6 +25,7 @@ func (oph *operationHistory) insert(op *Op, r *execOpResult) {
 }
 
 func (oph *operationHistory) serialization(e *labgob.LabEncoder) {
+	// TODO: Shall we compress history here?
 	e.Encode(oph.h)
 }
 

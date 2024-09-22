@@ -12,7 +12,6 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	leader  int
 	id      int64
-	seq     int64
 	// You will have to modify this struct.
 }
 
@@ -30,17 +29,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 
 	ck.leader = 0
 
-	ck.seq = 0
-
 	ck.id = nrand()
 
 	return ck
-}
-
-func (c *Clerk) getSeq() int64 {
-	o := c.seq
-	c.seq = c.seq + 1
-	return o
 }
 
 // fetch the current value for a key.
@@ -59,7 +50,7 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	reply := GetReply{}
 
-	args = GetArgs{clientRequestIdentity{ck.id, ck.getSeq()}, key}
+	args = GetArgs{clientRequestIdentity{ck.id, nrand()}, key}
 
 	for {
 		reply = GetReply{}
@@ -88,7 +79,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		log.Fatalf("unknown op %v", op)
 	}
 
-	args := PutAppendArgs{clientRequestIdentity{ck.id, ck.getSeq()}, key, value}
+	args := PutAppendArgs{clientRequestIdentity{ck.id, nrand()}, key, value}
 
 	for {
 		reply := PutAppendReply{}

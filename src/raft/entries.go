@@ -52,7 +52,7 @@ func (rl *raftLog) installSnapshot(last entryDescriptor, data []byte) bool {
 	return true
 }
 
-func (rl *raftLog) snapshot(index int, newSnapshot []byte) {
+func (rl *raftLog) snapshot(index int, newSnapshot []byte) error {
 	rl.lock()
 	defer rl.unlock()
 
@@ -61,7 +61,7 @@ func (rl *raftLog) snapshot(index int, newSnapshot []byte) {
 	}
 
 	if index < rl.s.Last.Index {
-		panic("Snapshot: invalid snapshot, last index of new snapshot smaller than old's, may cause entries lost")
+		return fmt.Errorf("snapshot: invalid snapshot, last index of new snapshot smaller than old's, may cause entries lost, index=%v, snapshotLast=%v", index, rl.s.Last.Index)
 	}
 
 	if index > rl.maxCommitedIndex {
@@ -78,6 +78,8 @@ func (rl *raftLog) snapshot(index int, newSnapshot []byte) {
 	if rl.isIndexInLog(index) {
 		rl.removeBeforeAnd(index)
 	}
+
+	return nil
 }
 
 func (rl *raftLog) String() string {

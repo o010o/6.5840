@@ -453,7 +453,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if debug {
 		log.Printf("me=%v, snapshot at %v", rf.me, index)
 	}
-	rf.log.snapshot(index, snapshot)
+
+	err := rf.log.snapshot(index, snapshot)
+	if err != nil {
+		return
+	}
 
 	rf.lock()
 	defer rf.unlock()

@@ -23,24 +23,28 @@ const NShards = 10
 // A configuration -- an assignment of shards to groups.
 // Please don't change this.
 type Config struct {
-	Num    int              // config number
-	Shards [NShards]int     // shard -> gid
+	Num    int          // config number
+	Shards [NShards]int // shard -> gid
+	// FIXME: be careful of the race beacuse asign will use same data.
 	Groups map[int][]string // gid -> servers[]
 }
 
 const (
-	OK = "OK"
+	OK             = "OK"
+	ErrWrongLeader = "ErrWrongLeader"
+	ErrRepeatedKey = "ErrRepeatedKey"
+	ErrUnknownOp   = "UnknownOperation"
 )
 
 type Err string
 
-type clientRequestIdentity struct {
+type ClientRequestIdentity struct {
 	ClientId  int64
 	RequestId int64
 }
 
 type JoinArgs struct {
-	Id      clientRequestIdentity
+	Id      ClientRequestIdentity
 	Servers map[int][]string // new GID -> servers mappings
 }
 
@@ -50,7 +54,7 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	Id   clientRequestIdentity
+	Id   ClientRequestIdentity
 	GIDs []int
 }
 
@@ -60,7 +64,7 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Id    clientRequestIdentity
+	Id    ClientRequestIdentity
 	Shard int
 	GID   int
 }
@@ -71,7 +75,7 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Id  clientRequestIdentity
+	Id  ClientRequestIdentity
 	Num int // desired config number
 }
 

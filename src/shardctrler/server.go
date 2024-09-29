@@ -1,9 +1,9 @@
 package shardctrler
 
 import (
-	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,14 +14,13 @@ import (
 )
 
 type ShardCtrler struct {
-	mu       sync.Mutex
-	me       int
-	rf       *raft.Raft
-	applyCh  chan raft.ApplyMsg
-	dead     int32
-	newOpCh  chan opMessage
-	resultCh chan execResult
-	history  operationHistory
+	mu      sync.Mutex
+	me      int
+	rf      *raft.Raft
+	applyCh chan raft.ApplyMsg
+	dead    int32
+	newOpCh chan opMessage
+	history operationHistory
 
 	// Your data here.
 
@@ -31,19 +30,24 @@ type ShardCtrler struct {
 type OpType int
 
 const (
+	Debug             bool          = false
 	Join              OpType        = 0
 	Leave             OpType        = 1
 	Move              OpType        = 2
 	Query             OpType        = 3
 	CheckTermInterval time.Duration = 100 * time.Millisecond
-	Debug             bool          = true
 )
 
 var (
-	ErrWrongLeader = errors.New("ErrWrongLeader")
-	ErrRepeatedKey = errors.New("ErrRepeatedKey")
-	EmptyNotify    = notify{nil, -1, -1, nil}
+	EmptyNotify = notify{nil, -1, -1, nil}
 )
+
+func max(lhs int, rhs int) int {
+	if lhs > rhs {
+		return lhs
+	}
+	return rhs
+}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -58,26 +62,45 @@ type Op struct {
 	Args interface{}
 }
 
-func (o *Op) getId() clientRequestIdentity {
+func (o *Op) String() string {
 	switch o.T {
 	case Join:
-		args := o.Args.(*JoinArgs)
+		args := o.Args.(JoinArgs)
+		return fmt.Sprintf("{op=Join, args=%v}", args)
+	case Leave:
+		args := o.Args.(LeaveArgs)
+		return fmt.Sprintf("{op=Leave, args=%v}", args)
+	case Move:
+		args := o.Args.(MoveArgs)
+		return fmt.Sprintf("{op=Move, args=%v}", args)
+	case Query:
+		args := o.Args.(QueryArgs)
+		return fmt.Sprintf("{op=Query, args=%v}", args)
+	default:
+		panic("unknown operation")
+	}
+}
+
+func (o *Op) getId() ClientRequestIdentity {
+	switch o.T {
+	case Join:
+		args := o.Args.(JoinArgs)
 		return args.Id
 	case Leave:
-		args := o.Args.(*LeaveArgs)
+		args := o.Args.(LeaveArgs)
 		return args.Id
 	case Move:
-		args := o.Args.(*MoveArgs)
+		args := o.Args.(MoveArgs)
 		return args.Id
 	case Query:
-		args := o.Args.(*QueryArgs)
+		args := o.Args.(QueryArgs)
 		return args.Id
 	}
-	return clientRequestIdentity{-1, -1}
+	return ClientRequestIdentity{-1, -1}
 }
 
 func (sc *ShardCtrler) tryNotify(msg *raft.ApplyMsg, result *execResult, no *notify) {
-	if no == nil || *no != EmptyNotify || result == nil || no.isEmpty() {
+	if no == nil || result == nil || no.isEmpty() {
 		return
 	}
 	// notify waiting thread if
@@ -116,9 +139,10 @@ func (sc *ShardCtrler) handleCommand(msg *raft.ApplyMsg) execResult {
 
 	// re-execute query because we dont record the execute result
 	if sc.history.find(&op) && op.T != Query {
-		return execResult{nil, nil}
+		return execResult{OK, nil}
 	}
 
+	DPrintf("me=%v, exec operation, index=%v, operation={%v}", sc.me, msg.CommandIndex, &op)
 	r := sc.execOp(&op)
 
 	sc.history.insert(&op, &r)
@@ -126,26 +150,39 @@ func (sc *ShardCtrler) handleCommand(msg *raft.ApplyMsg) execResult {
 	return r
 }
 
-func (sc *ShardCtrler) balanceServer(c *Config) {
+func (sc *ShardCtrler) balanceShard(c *Config) {
+
+	// --------------------------test--------------------------
+	sc.checkAppendedConfig(c)
+	//
+
+	// FIXME: config of different server is differ
+
 	// Balance requests:
 	// 1. Divide the shards into group as evenly as possible
 	// 2. Move shard as less as possible
-
-	averageShard := 0                                 // count of shard that each group should possess
-	shardsEachGroup := make([][]int, len(c.Groups)+1) // number of shard that each group possess
-	for i := 0; i < len(shardsEachGroup); i++ {
-		shardsEachGroup[i] = make([]int, 0)
+	averageShard := 0                                       // count of shard that each group should possess
+	shardsEachGroup := make(map[int][]int, len(c.Groups)+1) // number of shard that each group possess
+	groups := make([]int, 0)
+	for gid := range c.Groups {
+		shardsEachGroup[gid] = make([]int, 0)
+		groups = append(groups, gid)
 	}
+
+	// Processes group according sequence number size
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i] < groups[j]
+	})
 
 	// return if no group
 	if len(c.Groups) == 0 {
 		return
 	}
 
-	// get average shard of each group
-	averageShard = NShards / len(c.Groups)
+	// Get average number of shard that each group should possess, and each group should have at least 1 shard if there are enough shards
+	averageShard = max(NShards/len(c.Groups), 1)
 
-	// generate statistic on the number of shards each group possesses
+	// Generate statistic on the number of shards each group possesses
 	for shard, gid := range c.Shards {
 		shardsEachGroup[gid] = append(shardsEachGroup[gid], shard)
 	}
@@ -155,35 +192,47 @@ func (sc *ShardCtrler) balanceServer(c *Config) {
 	// 1. move shard which has bigger num first
 	// 2. move all shard of group 0
 
-	fromGroup := make([]int, 0) // These group have extra shard which can move to another group
-	toGroup := make([]int, 0)   // These group need more shard
+	fromGroups := make([]int, 0) // These group have extra shard which can move to another group
+	toGroups := make([]int, 0)   // These group need more shard
 
-	// init fromGroup and toGroup according to averageShard
-	fromGroup = append(fromGroup, 0)
-	for i := 1; i < len(shardsEachGroup); i++ {
-		if len(shardsEachGroup[i]) > averageShard {
-			fromGroup = append(fromGroup, i)
-		} else if len(shardsEachGroup[i]) < averageShard {
-			toGroup = append(toGroup, i)
+	// assign shard of group 0 to others
+	for i := 0; len(shardsEachGroup[0]) > 0; i = (i + 1) % len(c.Groups) {
+		shardsEachGroup[groups[i]] = append(shardsEachGroup[groups[i]], shardsEachGroup[0][len(shardsEachGroup[0])-1])
+		shardsEachGroup[0] = shardsEachGroup[0][0 : len(shardsEachGroup[0])-1]
+	}
+
+	// init fromGroup and toGroups according to averageShard
+	for i := 0; i < len(groups); i++ {
+		gid := groups[i]
+		if len(shardsEachGroup[gid]) > averageShard {
+			fromGroups = append(fromGroups, gid)
+		} else if len(shardsEachGroup[gid]) < averageShard {
+			toGroups = append(toGroups, gid)
 		}
 	}
 
-	// move shard from fromGroup to toGroup
-	for len(toGroup) > 0 && len(fromGroup) > 0 {
-		toNum := toGroup[0]
-		fromNum := fromGroup[0]
+	DPrintf("me=%v, before balance, shards={%v}, shardsEachGroup={%v}, averageShard=%v, fromGroups={%v}, toGroups={%v}", sc.me, c.Shards, shardsEachGroup, averageShard, fromGroups, toGroups)
+
+	// move shard from fromGroups to toGroups
+	for len(toGroups) > 0 && len(fromGroups) > 0 {
+		toNum := toGroups[0]
+		fromNum := fromGroups[0]
 
 		for len(shardsEachGroup[toNum]) < averageShard {
-			shardsEachGroup[toNum] = append(shardsEachGroup[toNum], shardsEachGroup[fromNum][len(shardsEachGroup)-1])
-			shardsEachGroup[fromNum] = shardsEachGroup[fromNum][0 : len(shardsEachGroup)-1]
-			if len(shardsEachGroup[fromNum]) <= averageShard {
-				fromGroup = fromGroup[1:]
+			shardsEachGroup[toNum] = append(shardsEachGroup[toNum], shardsEachGroup[fromNum][len(shardsEachGroup[fromNum])-1])
+			shardsEachGroup[fromNum] = shardsEachGroup[fromNum][0 : len(shardsEachGroup[fromNum])-1]
+
+			if len(shardsEachGroup[fromNum]) <= averageShard && len(shardsEachGroup[fromNum]) > 0 {
 				break
 			}
 		}
 
+		if len(shardsEachGroup[fromNum]) <= averageShard {
+			fromGroups = fromGroups[1:]
+		}
+
 		if len(shardsEachGroup[toNum]) >= averageShard {
-			toGroup = toGroup[1:]
+			toGroups = toGroups[1:]
 		}
 	}
 
@@ -195,6 +244,9 @@ func (sc *ShardCtrler) balanceServer(c *Config) {
 	}
 
 	c.Shards = newShard
+
+	DPrintf("me=%v, after balance, newShard={%v}, shardsEachGroup={%v}, fromGroups={%v}, toGroups={%v}", sc.me, newShard, shardsEachGroup, fromGroups, toGroups)
+	// DPrintf("me=%v, balance shards, oldShard=%v, newShard=%v", sc.me, c.Shards, newShard)
 }
 
 func (sc *ShardCtrler) doJoin(args *JoinArgs) execResult {
@@ -213,31 +265,32 @@ func (sc *ShardCtrler) doJoin(args *JoinArgs) execResult {
 		copy(newConfig.Groups[gid], servers)
 	}
 
-	sc.balanceServer(newConfig)
+	sc.balanceShard(newConfig)
 
 	sc.addNewConfig(newConfig)
 
-	return execResult{nil, nil}
+	return execResult{OK, nil}
 }
 
 func (sc *ShardCtrler) doLeave(args *LeaveArgs) execResult {
 	newConfig := sc.configs[len(sc.configs)-1].dup()
 
-	for gid := range args.GIDs {
+	for _, gid := range args.GIDs {
 		// delete map between shard and group, then delete group
 		for i, g := range newConfig.Shards {
 			if g == gid {
 				newConfig.Shards[i] = 0
 			}
 		}
+
 		delete(newConfig.Groups, gid)
 	}
 
-	sc.balanceServer(newConfig)
+	sc.balanceShard(newConfig)
 
 	sc.addNewConfig(newConfig)
 
-	return execResult{nil, nil}
+	return execResult{OK, nil}
 }
 
 func (sc *ShardCtrler) doMove(args *MoveArgs) execResult {
@@ -247,50 +300,51 @@ func (sc *ShardCtrler) doMove(args *MoveArgs) execResult {
 
 	sc.addNewConfig(newConfig)
 
-	return execResult{nil, nil}
+	return execResult{OK, nil}
 }
 
 func (sc *ShardCtrler) doQuery(args *QueryArgs) execResult {
 	if args.Num == -1 || args.Num > sc.configs[len(sc.configs)-1].Num {
-		return execResult{nil, &sc.configs[len(sc.configs)-1]}
+		return execResult{OK, &sc.configs[len(sc.configs)-1]}
 	}
 
-	return execResult{nil, &sc.configs[args.Num]}
+	return execResult{OK, &sc.configs[args.Num]}
 }
 
 func (sc *ShardCtrler) execOp(op *Op) execResult {
+
 	switch op.T {
 	case Join:
-		args, ok := op.Args.(*JoinArgs)
+		args, ok := op.Args.(JoinArgs)
 		if !ok {
 			panic("can not get JoinArgs")
 		}
-		return sc.doJoin(args)
+		return sc.doJoin(&args)
 	case Leave:
-		args, ok := op.Args.(*LeaveArgs)
+		args, ok := op.Args.(LeaveArgs)
 		if !ok {
 			panic("can not get LeaveArgs")
 		}
-		return sc.doLeave(args)
+		return sc.doLeave(&args)
 	case Move:
-		args, ok := op.Args.(*MoveArgs)
+		args, ok := op.Args.(MoveArgs)
 		if !ok {
 			panic("can not get MoveArgs")
 		}
-		return sc.doMove(args)
+		return sc.doMove(&args)
 	case Query:
-		args, ok := op.Args.(*QueryArgs)
+		args, ok := op.Args.(QueryArgs)
 		if !ok {
 			panic("can not get QueryArgs")
 		}
-		return sc.doQuery(args)
+		return sc.doQuery(&args)
 	}
 
-	return execResult{errors.New("unknown operation"), nil}
+	return execResult{ErrUnknownOp, nil}
 }
 
 type execResult struct {
-	Err    error
+	err    Err
 	result interface{}
 }
 
@@ -329,7 +383,7 @@ func (sc *ShardCtrler) worker() {
 		case n := <-sc.newOpCh:
 			// spread operation and init notify
 
-			index, term, isLeader := sc.rf.Start(n.op)
+			index, term, isLeader := sc.rf.Start(*n.op)
 			if !isLeader {
 				n.resultCh <- &execResult{ErrWrongLeader, nil}
 			} else {
@@ -354,7 +408,7 @@ func (sc *ShardCtrler) worker() {
 	}
 }
 
-func (sc *ShardCtrler) execDispatch(op *Op) (interface{}, error) {
+func (sc *ShardCtrler) execDispatch(op *Op) (interface{}, Err) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -364,51 +418,83 @@ func (sc *ShardCtrler) execDispatch(op *Op) (interface{}, error) {
 	// wait until executing operation done
 	res := <-resultCh
 
-	return res.result, res.Err
+	return res.result, res.err
 }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
-	_, err := sc.execDispatch(&Op{Join, args})
-	if err != nil {
-		*reply = JoinReply{true, Err(err.Error())}
+	DPrintf("me=%v, join {%v}", sc.me, *args)
+
+	_, err := sc.execDispatch(&Op{Join, *args})
+	if err != OK {
+		*reply = JoinReply{true, err}
 	} else {
 		*reply = JoinReply{false, OK}
 	}
+
+	DPrintf("me=%v, reply {%v}", sc.me, *reply)
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	_, err := sc.execDispatch(&Op{Leave, args})
-	if err != nil {
-		*reply = LeaveReply{true, Err(err.Error())}
+	// FIXME: leave failed...
+	DPrintf("me=%v, leave {%v}", sc.me, *args)
+
+	_, err := sc.execDispatch(&Op{Leave, *args})
+	if err != OK {
+		*reply = LeaveReply{true, err}
 	} else {
 		*reply = LeaveReply{false, OK}
 	}
+
+	DPrintf("me=%v, reply {%v}", sc.me, *reply)
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	_, err := sc.execDispatch(&Op{Move, args})
-	if err != nil {
-		*reply = MoveReply{true, Err(err.Error())}
+	DPrintf("me=%v, move {%v}", sc.me, *args)
+
+	_, err := sc.execDispatch(&Op{Move, *args})
+	if err != OK {
+		*reply = MoveReply{true, err}
 	} else {
 		*reply = MoveReply{false, OK}
 	}
+
+	DPrintf("me=%v, reply {%v}", sc.me, *reply)
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	res, err := sc.execDispatch(&Op{Move, args})
-	if err != nil {
-		*reply = QueryReply{true, Err(err.Error()), Config{}}
+	DPrintf("me=%v, query {%v}", sc.me, *args)
+	res, err := sc.execDispatch(&Op{Query, *args})
+	if err != OK {
+		*reply = QueryReply{true, err, Config{}}
 	} else {
-		r, ok := res.(Config)
+		r, ok := res.(*Config)
 		if !ok {
 			panic("execute successfully, but dont get result")
 		}
-		*reply = QueryReply{false, OK, r}
+		*reply = QueryReply{false, OK, *r}
+	}
+	DPrintf("me=%v, reply {%v}", sc.me, *reply)
+}
+
+func (sc *ShardCtrler) checkAppendedConfig(c *Config) {
+	for _, group := range c.Shards {
+		if group == 0 {
+			continue
+		}
+		_, ok := c.Groups[group]
+		if !ok {
+			panic(fmt.Sprintf("checkAppendedConfig: group %v is not existed, shards={%v}, groups={%v}", group, c.Shards, c.Groups))
+		}
 	}
 }
 
 func (sc *ShardCtrler) addNewConfig(c *Config) {
 	c.Num = sc.configs[len(sc.configs)-1].Num + 1
+
+	// -------------------test---------------------
+	sc.checkAppendedConfig(c)
+	// --------------------------------------------
+
 	sc.configs = append(sc.configs, *c)
 }
 
@@ -432,31 +518,6 @@ func (sc *ShardCtrler) Raft() *raft.Raft {
 	return sc.rf
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant shardctrler service.
-// me is the index of the current server in servers[].
-func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
-	sc := new(ShardCtrler)
-	sc.me = me
-
-	sc.configs = make([]Config, 1)
-	sc.configs[0].Groups = map[int][]string{}
-
-	labgob.Register(Op{})
-	sc.applyCh = make(chan raft.ApplyMsg)
-	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
-
-	sc.newOpCh = make(chan opMessage, 1)
-	sc.resultCh = make(chan execResult, 1)
-	sc.history.construct()
-
-	// Your code here.
-	go sc.worker()
-
-	return sc
-}
-
 func (c *Config) dup() *Config {
 	newConfig := Config{}
 
@@ -471,4 +532,55 @@ func (c *Config) dup() *Config {
 	}
 
 	return &newConfig
+}
+
+func (c *Config) GetGid(sId int) int {
+	if sId < 0 || sId > len(c.Shards) {
+		panic("Invalid sId")
+	}
+	return c.Shards[sId]
+}
+
+func (c *Config) GetServers(gid int) []string {
+	servers, ok := c.Groups[gid]
+	if !ok {
+		return []string{}
+	}
+	return servers
+}
+
+func (c *Config) String() string {
+	return fmt.Sprintf("cid=%v, shards={%v}, groups={%v}", c.GetCid(), c.Shards, c.Groups)
+}
+
+func (c *Config) GetCid() int {
+	return c.Num
+}
+
+// servers[] contains the ports of the set of
+// servers that will cooperate via Raft to
+// form the fault-tolerant shardctrler service.
+// me is the index of the current server in servers[].
+func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardCtrler {
+	sc := new(ShardCtrler)
+	sc.me = me
+
+	sc.configs = make([]Config, 1)
+	sc.configs[0].Groups = map[int][]string{}
+
+	labgob.Register(Op{})
+	labgob.Register(JoinArgs{})
+	labgob.Register(LeaveArgs{})
+	labgob.Register(MoveArgs{})
+	labgob.Register(QueryArgs{})
+	sc.applyCh = make(chan raft.ApplyMsg)
+	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
+
+	sc.newOpCh = make(chan opMessage, 1)
+	sc.history.construct()
+
+	// Your code here.
+	go sc.worker()
+
+	return sc
 }

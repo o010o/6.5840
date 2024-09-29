@@ -10,16 +10,22 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrUnknownArgs    = "ErrUnknownArgs"
+	ErrConnectFailed  = "ErrConnectFailed"
+	ErrHaveMigrated   = "ErrHaveMigrated"
+	ErrConfigNotMatch = "ErrConfigNotMatch"
+	ErrFallbackConfig = "ErrFallbackConfig"
 )
 
 type Err string
 
 // Put or Append
 type PutAppendArgs struct {
+	Id ClientRequestIdentity
 	// You'll have to add definitions here.
 	Key   string
 	Value string
@@ -34,6 +40,7 @@ type PutAppendReply struct {
 }
 
 type GetArgs struct {
+	Id  ClientRequestIdentity
 	Key string
 	// You'll have to add definitions here.
 }
@@ -41,4 +48,40 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type MigrateArgs struct {
+	Id     ClientRequestIdentity
+	Config shardConfig
+	Data   migratedData
+}
+
+type MigrateReply struct {
+	Err Err
+}
+
+type UpdateConfigArgs struct {
+	Id     ClientRequestIdentity
+	Config shardConfig
+}
+
+type UpdateConfigReply struct {
+	Err Err
+}
+
+type DeleteArgs struct {
+	Id  ClientRequestIdentity
+	SId int
+}
+
+type DeleteReply struct {
+	Err Err
+}
+
+type GetConfigArgs struct {
+	SId int
+}
+
+type GetConfigReply struct {
+	Config shardConfig
 }

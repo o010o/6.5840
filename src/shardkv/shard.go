@@ -80,13 +80,13 @@ func (s *shard) isShardEnable(sId int) bool {
 	return s.c[sId].St == stateOwner
 }
 
-func (s *shard) isFromPeer(args *UpdateConfigArgs) bool {
+func isFromPeer(args *UpdateConfigArgs) bool {
 	return args.Id != EmptyClientRequestIdentity
 }
 
 func (s *shard) doUpdateConfig(args *UpdateConfigArgs) (interface{}, error) {
 	nc := &args.Config
-	if s.isFromPeer(args) {
+	if isFromPeer(args) {
 		c := s.dupConfig(nc.SId)
 		if nc.CId > c.CId+1 {
 			return nil, errors.New(ErrConfigNotMatch)

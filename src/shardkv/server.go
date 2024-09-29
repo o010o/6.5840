@@ -18,7 +18,7 @@ import (
 type MigrateDirectState uint8
 
 const (
-	Debug                                  = false
+	Debug                                  = true
 	CheckTermInterval   time.Duration      = 100 * time.Millisecond
 	UpdateShardInterval time.Duration      = 100 * time.Millisecond
 	MigrateDirectTo     MigrateDirectState = 1
@@ -225,9 +225,6 @@ func (kv *ShardKV) MigrateKV(args *MigrateArgs, reply *MigrateReply) {
 	// - Cid1 = Cid2. But it seems that Cid1 > Cid2 is ok.
 	DPrintf("%v, MigrateKVRequest, args={%v}", kv, args)
 
-	// Prevent newer shard from being influence by older shard.
-	// kv.deleteShard(args.Config.SId)
-
 	op := Op{OpMigrate, *args}
 	_, err := kv.execDispatch(&op)
 
@@ -325,14 +322,9 @@ func (kv *ShardKV) applyCommand(index int, command interface{}) execResult {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// Sends response if write(Append(), Put()) has been executed. Re-executes read(Get()) request.
-	if op.T != OpGet && kv.opHistory.find(&op) {
+	if kv.opHistory.find(&op) {
 		return execResult{OK, nil}
 	}
-
-	// TODO: It seems that it is not necessary to execute Query when there is no listener
-	// There are certain operations that can only be exeuted by the leader!!!
-	// Like, query, and
 
 	kv.ir.advanceLast(index)
 
@@ -430,14 +422,6 @@ func (kv *ShardKV) applyOperation(index int, op *Op) execResult {
 		} else {
 			panic("Unknown operation")
 		}
-		return execResult{OK, nil}
-	case OpDelete:
-		args, ok := op.Args.(DeleteArgs)
-		if !ok {
-			panic("execOp")
-		}
-
-		kv.database.delete(args.SId)
 		return execResult{OK, nil}
 	case OpUpdateConfig:
 		args, ok := op.Args.(UpdateConfigArgs)
@@ -714,7 +698,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-	labgob.Register(DeleteArgs{})
 	labgob.Register(UpdateConfigArgs{})
 	labgob.Register(PutAppendArgs{})
 	labgob.Register(GetArgs{})

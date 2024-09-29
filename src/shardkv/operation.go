@@ -9,7 +9,6 @@ type OpType int
 const (
 	OpGet          OpType = 1
 	OpPutAppend    OpType = 2
-	OpDelete       OpType = 3
 	OpUpdateConfig OpType = 4
 	OpMigrate      OpType = 5
 	OpGetConfig    OpType = 6
@@ -31,9 +30,6 @@ func (o *Op) getIdentity() ClientRequestIdentity {
 	case OpGet:
 		args := o.Args.(GetArgs)
 		return args.Id
-	case OpDelete:
-		args := o.Args.(DeleteArgs)
-		return args.Id
 	case OpUpdateConfig:
 		args := o.Args.(UpdateConfigArgs)
 		return args.Id
@@ -51,7 +47,6 @@ func (o *Op) String() string {
 	var opsName map[OpType]string = map[OpType]string{
 		OpGet:          "Get",
 		OpPutAppend:    "PutAppend",
-		OpDelete:       "Delete",
 		OpUpdateConfig: "UpdateConfig",
 		OpMigrate:      "Migrate",
 		OpGetConfig:    "GetConfig",
@@ -65,9 +60,6 @@ func (o *Op) String() string {
 		str = str + fmt.Sprintf("args={%v}", &args)
 	case OpGet:
 		args := o.Args.(GetArgs)
-		str = str + fmt.Sprintf("args={%v}", &args)
-	case OpDelete:
-		args := o.Args.(DeleteArgs)
 		str = str + fmt.Sprintf("args={%v}", &args)
 	case OpUpdateConfig:
 		args := o.Args.(UpdateConfigArgs)
@@ -95,10 +87,6 @@ func (args *UpdateConfigArgs) String() string {
 
 func (args *GetArgs) String() string {
 	return fmt.Sprintf("Id=%v, K=%v, sId=%v", args.Id, args.Key, key2shard(args.Key))
-}
-
-func (args *DeleteArgs) String() string {
-	return fmt.Sprintf("Id=%v, sId=%v", args.Id, args.SId)
 }
 
 func (args *MigrateArgs) String() string {

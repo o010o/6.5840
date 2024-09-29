@@ -82,32 +82,22 @@ func (kv *ShardKV) String() string {
 	return fmt.Sprintf("me=%v, gid=%v", kv.me, kv.gid)
 }
 
-func (kv *ShardKV) updateConfig(sId int, nCid int, nGid int, nSt shardState) (interface{}, Err) {
+func (kv *ShardKV) updateConfig(sId int, nCid int, nGid int, nSt shardState, crId *ClientRequestIdentity) (interface{}, Err) {
 	DPrintf("%v, updateConfig, newConfig={sId=%v, nCid=%v, nGid=%v, nSt=%v}", kv, sId, nCid, nGid, stateName[nSt])
-	op := Op{OpUpdateConfig, UpdateConfigArgs{ClientRequestIdentity{kv.clientId, nrand()}, shardConfig{sId, nCid, nGid, nSt}}}
+	args := UpdateConfigArgs{EmptyClientRequestIdentity, shardConfig{sId, nCid, nGid, nSt}}
+	if crId != nil {
+		args.Id = *crId
+	}
+	op := Op{OpUpdateConfig, args}
 	return kv.execDispatch(&op)
 }
 
 func (kv *ShardKV) UpdateConfig(args *UpdateConfigArgs, reply *UpdateConfigReply) {
 	DPrintf("%v, UpdateConfig, args={%v}", kv, args)
 
-	// FIXME: A race condition occured when this server is migrating shard, and another server is re-transfer ownership to this server
-	// No, I dont think re-transfer could reach here, because the configs are not matched.
-
-	// TODO: So, the dup is not saft. Try to solve it.
-
-	// Race if two leader(one is old the other is new) reach here.
-	// This server may migrate shard after ole leader change the state
-	// Then the new leader change the state again, so the state would be massed.
-
-	// There may be other questions similar to the one above. I believe it is the architure that causes these problems.
-	_, err := kv.updateConfig(args.Config.SId, args.Config.CId, args.Config.GId, args.Config.St)
+	_, err := kv.updateConfig(args.Config.SId, args.Config.CId, args.Config.GId, args.Config.St, &args.Id)
 
 	*reply = UpdateConfigReply{err}
-
-	// FIXME: This server may start to execute procedure migrate() here
-	// and the code may overwrite the disable in migrate(), which cause a migrated shard being served.
-	// kv.updateAvailable()
 }
 
 type migratedData struct {
@@ -121,7 +111,7 @@ func (kv *ShardKV) generateMigrateData(c *shardConfig) migratedData {
 	defer kv.mu.Unlock()
 
 	md := migratedData{}
-	// TODO: only dup the history of shard c.SID
+
 	md.History = kv.opHistory.dupHistory(c.SId)
 	md.Keys, md.Values = kv.database.fetchKVs(c.SId)
 
@@ -130,8 +120,11 @@ func (kv *ShardKV) generateMigrateData(c *shardConfig) migratedData {
 
 func (kv *ShardKV) sendShardTo(c *shardConfig, nc *shardctrler.Config) error {
 	// TODO: Divide shard into multi messages and each k/v pair is wrapped into one Put operation. Then send to peer.
-	// Divide advantage:
-	// 1. Dont need to send all the pair, when need to re-migrate
+	// Partition advantage:
+	// 1. It is not necessary to send all the pair from the begining when the system requires re-migration.
+	// Disadvantage:
+	// 1. The sending state needs to be maintained.
+	// We should implement partition if the data is large because maintaining the sending state is more efficient than resending.
 	if c.St != stateMigrate {
 		panic(fmt.Sprintf("%v, invalid state, c={%v}, nc={%v}", kv, c, nc))
 	}
@@ -190,7 +183,7 @@ func (kv *ShardKV) migrate(c *shardConfig, nc *shardctrler.Config) error {
 
 PHASE1:
 	DPrintf("%v, migrate phase 1, disable shard, c={%v}", kv, c)
-	_, errStr = kv.updateConfig(c.SId, c.CId, c.GId, stateMigrate)
+	_, errStr = kv.updateConfig(c.SId, c.CId, c.GId, stateMigrate, nil)
 	if errStr != OK {
 		return errors.New("updateConfig failed")
 	}
@@ -281,11 +274,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("%v, GetApply, reply={%v}", kv, reply)
 }
 
-func (kv *ShardKV) deleteShard(sId int) {
-	op := Op{OpDelete, DeleteArgs{ClientRequestIdentity{kv.clientId, nrand()}, sId}}
-	kv.execDispatch(&op)
-}
-
 func (kv *ShardKV) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
@@ -342,13 +330,12 @@ func (kv *ShardKV) applyCommand(index int, command interface{}) execResult {
 		return execResult{OK, nil}
 	}
 
-	// TODO: It seems that it is no need to execute Query when there is no listener
+	// TODO: It seems that it is not necessary to execute Query when there is no listener
 	// There are certain operations that can only be exeuted by the leader!!!
-	// Like, query, and migrate
+	// Like, query, and
 
 	kv.ir.advanceLast(index)
 
-	// FIXME: This server should detect repeated request from migrating server.
 	r := kv.applyOperation(index, &op)
 
 	// Record operation which has been applied to prevent re-execution.
@@ -432,8 +419,6 @@ func (kv *ShardKV) applyOperation(index int, op *Op) execResult {
 			panic("execOp")
 		}
 
-		// FIXME: operation happend between stateMigrate and NotOwner, will execute failed because of state.
-		// when we try to re-execute it in another server, it will be regarded as repeated request, and will not be executed.
 		if !kv.shard.isShardEnable(key2shard(args.Key)) {
 			return execResult{ErrWrongGroup, nil}
 		}
@@ -460,12 +445,17 @@ func (kv *ShardKV) applyOperation(index int, op *Op) execResult {
 			panic("execOp")
 		}
 
-		// FIXME:
-		_, err := kv.shard.doUpdateConfig(&args.Config)
+		_, err := kv.shard.doUpdateConfig(&args)
 		if err != nil {
-			DPrintf("%v, update config failed, c={%v}, nc={%v}", kv, kv.shard.c[args.Config.SId], &args.Config)
+			DPrintf("%v, update config failed, err={%v}, c={%v}, nc={%v}", kv, err.Error(), &kv.shard.c[args.Config.SId], &args.Config)
 			return execResult{Err(err.Error()), nil}
 		}
+
+		c := kv.shard.dupConfig(args.Config.SId)
+		if c.St == stateNotOwner {
+			kv.database.delete(args.Config.SId)
+		}
+
 		return execResult{OK, nil}
 	case OpMigrate:
 		args, ok := op.Args.(MigrateArgs)
@@ -517,10 +507,6 @@ func (kv *ShardKV) migrateDirect(c *shardConfig, nc *shardctrler.Config) Migrate
 }
 
 func (kv *ShardKV) updateShard(sId int) {
-	// FIXME: The whold work flow is complex, and does not work well.
-	// There are so many error, and hard to analysis
-	// Try to simplify the model.
-
 	// Only one thread is permitted to process the shard.
 	kv.shard.markProcessing(sId)
 	defer kv.shard.unmarkProcessing(sId)
@@ -545,10 +531,9 @@ func (kv *ShardKV) updateShard(sId int) {
 
 	switch direct {
 	case MigrateDirectFrom:
-		// TODO: waiting until data and ownership reach?
 		DPrintf("%v, MigrateFrom, c={%v}, nc={%v}", kv, c, nc)
 		if c.GId == 0 {
-			_, err := kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateOwner)
+			_, err := kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateOwner, nil)
 			if err != OK {
 				DPrintf("%v, update config failed, sId=%v, nc=%v, ng=%v, st=O", kv, c.SId, nc.GetCid(), nc.GetGid(c.SId))
 			} else {
@@ -561,8 +546,9 @@ func (kv *ShardKV) updateShard(sId int) {
 		if c.St != stateOwner {
 			panic("Invalid state")
 		}
-		kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateOwner)
+		kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateOwner, nil)
 	case MigrateDirectTo:
+		// migrate date to another server
 		if nc.GetGid(c.SId) == 0 {
 			panic("migrate shard to group 0, which could loss shard")
 		}
@@ -571,68 +557,20 @@ func (kv *ShardKV) updateShard(sId int) {
 			panic("Invalid state")
 		}
 
-		// FIXME: New leader will re-execute migration after old leader had completed migration
 		DPrintf("%v, MigrateTo, c={%v}, nc={%v}", kv, c, nc)
 		kv.migrate(c, nc)
-		// Send k/v pairs or transfer ownership according to the state.
 	case MigrateDirectNo:
 		// This server does not participate in the migration.
 		if c.St != stateNotOwner {
 			panic("Invalid state")
 		}
 		DPrintf("%v, MigrateNo, c={%v}, nc={%v}", kv, c, nc)
-		// kv.deleteShard(c.SId)
-		kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateNotOwner)
+
+		kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateNotOwner, nil)
 	default:
 		panic("unknown direct")
 	}
-
-	// s
-	// Gid is the gourp id of current server.
-	// assert c.cid = nc.cid
-
-	// c.gid == gid:
-	// 		nc.gid = c.gid -> c <- nc
-	// 		st(s) = O, do migrate.
-	// 		st(s) = T, do transfer ownership.
-	// 		st(s) = N, panic.
-
-	// c.gid != gid:
-	// assert st(s) != O, T
-	// c <- nc
-
-	// FIXME: dead lock?
-	// Case that may cause race:
-	// shard  1     2
-	// group  1     2
-
-	// shard  1     2
-	// group  2     1
-
-	// group 1 migrate k/v to group 2, and group 2 migrate k/v to group 1, may dead lock.
-
-	// this algorithm request:
-	// 1. Persist config.
-	// 2. Let the leader control the migrate
-	// 3. Disable shard immediately when a group loss shard.
-	// 4. Move shard in the sequence of config
-	// 5. Migreation could be repeated, so the server should do repeated detect.
-	// 6. Migreate only the two leader have same config number.
 }
-
-// func (kv *ShardKV) updateAvailable() {
-// 	kv.mu.Lock()
-// 	defer kv.mu.Unlock()
-
-// 	for i := 0; i < len(kv.shard.availables); i++ {
-// 		if kv.shard.c[i].st == stateOwner {
-// 			if kv.shard.c[i].gId != kv.gid {
-// 				panic(fmt.Sprintf("Invalid state of shard, shard={%v}", kv.shard))
-// 			}
-// 			kv.shard.availables[i] = true
-// 		}
-// 	}
-// }
 
 func (kv *ShardKV) transferOwnership(c *shardConfig, nc *shardctrler.Config) error {
 	// Work flow of transfer ownership
@@ -662,7 +600,7 @@ func (kv *ShardKV) transferOwnership(c *shardConfig, nc *shardctrler.Config) err
 
 PHASE1:
 	DPrintf("%v, transferOwnership phase 1, mark transfer, c={%v}", kv, c)
-	_, err = kv.updateConfig(c.SId, c.CId, c.GId, stateTransfer)
+	_, err = kv.updateConfig(c.SId, c.CId, c.GId, stateTransfer, nil)
 	if err != OK {
 		DPrintf("%v, updateConfig failed at phase 1 in transferOwnership, c={%v}, nc={%v}", kv, c, nc)
 		return errors.New(string(err))
@@ -703,7 +641,7 @@ PHASE2:
 	}
 
 	DPrintf("%v, transferOwnership phase 3, mark not owner, c={%v}", kv, c)
-	_, err = kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateNotOwner)
+	_, err = kv.updateConfig(c.SId, nc.GetCid(), nc.GetGid(c.SId), stateNotOwner, nil)
 	if err != OK {
 		DPrintf("%v, updateConfig failed at phase 3 in transferOwnership, c={%v}, nc={%v}", kv, c, nc)
 		return errors.New(string(err))
@@ -733,22 +671,12 @@ func (kv *ShardKV) updateConfigWorker() {
 		// XXX:This code is Bullshit
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
-			// FIXME: may not be a leader at this moment
-			// TODO: How to ensure that only the leader update shard.
+			//  may not be a leader at this moment, but follower or older leader will get error when it call updateShard
 			for sId := 0; sId < len(kv.shard.c); sId++ {
 				if kv.shard.isProcessing(sId) {
 					continue
 				}
 				go kv.updateShard(sId)
-				// // FIXME: There are some commited entries may not be applied here, so the state of shard may be stale.
-				// // c := kv.shard.dupConfig(i)
-				// c := kv.getConfig(i)
-				// isPro := kv.shard.isProcessing(c.SId)
-				// if isPro {
-				// 	continue
-				// }
-
-				// go kv.updateShard(&c)
 			}
 		}
 
@@ -810,7 +738,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.clientId = nrand()
 	kv.cache.construct(ctrlers)
 	kv.shard.construct()
-	// TODO: labgob may need to register more struct.
 	//--------------------
 
 	// Use something like this to talk to the shardctrler:

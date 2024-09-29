@@ -46,11 +46,6 @@ func (sc *shardConfig) String() string {
 type shard struct {
 	c [shardctrler.NShards]shardConfig
 
-	// Is each shard available?
-	// For shard asigned to this server, it is available if all key/value belong to it has been stored in this server.
-	// For shard not asigned to this server, it is un-available.
-	// FIXME: may lost when fault happened.
-	minCid     int
 	mu         sync.Mutex
 	threadCnts [shardctrler.NShards]int8
 }
@@ -70,9 +65,6 @@ func (s *shard) String() string {
 }
 
 func (s *shard) dupConfig(sId int) shardConfig {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if sId < 0 || sId >= len(s.c) {
 		panic(fmt.Sprintf("Invalid sId, sId=%v", sId))
 	}
@@ -81,9 +73,6 @@ func (s *shard) dupConfig(sId int) shardConfig {
 }
 
 func (s *shard) isShardEnable(sId int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if sId < 0 || sId >= len(s.c) {
 		panic(fmt.Sprintf("Invalid sId, sId=%v", sId))
 	}
@@ -91,36 +80,39 @@ func (s *shard) isShardEnable(sId int) bool {
 	return s.c[sId].St == stateOwner
 }
 
-func (s *shard) doUpdateConfig(nc *shardConfig) (interface{}, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *shard) isFromPeer(args *UpdateConfigArgs) bool {
+	return args.Id != EmptyClientRequestIdentity
+}
 
-	if !s.isProgressConfig(nc) {
-		return nil, errors.New(ErrHaveMigrated)
+func (s *shard) doUpdateConfig(args *UpdateConfigArgs) (interface{}, error) {
+	nc := &args.Config
+	if s.isFromPeer(args) {
+		c := s.dupConfig(nc.SId)
+		if nc.CId > c.CId+1 {
+			return nil, errors.New(ErrConfigNotMatch)
+		} else if nc.CId < c.CId+1 {
+			return nil, errors.New(ErrHaveMigrated)
+		} else {
+			if !(c.St == stateNotOwner && nc.St == stateOwner) {
+				return nil, errors.New(ErrHaveMigrated)
+			}
+		}
+	} else {
+		if !s.isProgressConfig(nc) {
+			return nil, errors.New(ErrFallbackConfig)
+		}
 	}
-
-	// TODO: update available here?
-	// No, available is not always tied to state.
-	// Raise some case?
 
 	s.c[nc.SId] = *nc
 
-	// kv.shard.recordMinCid(nCid)
-	// kv.cache.removeBelow(kv.shard.minCid)
 	return nil, nil
 }
 
 func (s *shard) serialization(e *labgob.LabEncoder) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	e.Encode(s.c)
 }
 
 func (s *shard) unSerialization(d *labgob.LabDecoder) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	tmp := [shardctrler.NShards]shardConfig{}
 	if d.Decode(&tmp) != nil {
 		panic("unSerialization")
@@ -131,7 +123,7 @@ func (s *shard) unSerialization(d *labgob.LabDecoder) {
 func (s *shard) isProgressConfig(nc *shardConfig) bool {
 	c := &s.c[nc.SId]
 	if c.CId+1 == nc.CId {
-		// NotOwner -> Owner/NotOwner, Owner -> NotOwner/Owner
+		// NotOwner -> Owner/NotOwner, Owner -> Owner
 		if c.St == stateNotOwner && (nc.St == stateOwner || nc.St == stateNotOwner) {
 			// no migrate or MigrateFrom
 			return true
@@ -147,7 +139,7 @@ func (s *shard) isProgressConfig(nc *shardConfig) bool {
 	} else if c.CId == nc.CId {
 		// Owner -> Migrate -> Transfer
 		if c.GId != nc.GId {
-			panic(fmt.Sprintf("same config should have same gid, "))
+			panic(fmt.Sprintf("same config should have same gid, c={%v}", c))
 		}
 		if c.St == stateOwner && nc.St == stateMigrate {
 			// MigrateTo
@@ -182,10 +174,4 @@ func (s *shard) unmarkProcessing(sId int) {
 	defer s.mu.Unlock()
 
 	s.threadCnts[sId]--
-}
-
-func (s *shard) recordMinCid(cid int) {
-	if cid < s.minCid {
-		s.minCid = cid
-	}
 }

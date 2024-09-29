@@ -15,23 +15,6 @@ type operationHistory struct {
 	or map[int64]int64
 }
 
-// func (oph *operationHistory) String() string {
-// 	var str string
-// 	str += "sr:\n"
-// 	for i := 0; i < len(oph.sr); i++ {
-// 		str += fmt.Sprintf("%v:\n", i)
-// 		for cid, rid := range oph.sr[i] {
-// 			str += fmt.Sprintf("\t%v\t%v\n", cid, rid)
-// 		}
-// 	}
-
-// 	str += "or:\n"
-// 	for k, v := range oph.or {
-// 		str += fmt.Sprintf("\t%v\t%v\n", k, v)
-// 	}
-// 	return str
-// }
-
 func (oph *operationHistory) dupHistory(sid int) map[int64]int64 {
 	c := make(map[int64]int64, 0)
 	for cid, rid := range oph.sr[sid] {
@@ -83,6 +66,10 @@ func (oph *operationHistory) find(o *Op) bool {
 		return oph.sr[args.SId][args.Id.ClientId] == args.Id.RequestId
 	case OpUpdateConfig:
 		args := o.Args.(UpdateConfigArgs)
+		if args.Id == EmptyClientRequestIdentity {
+			// update from inner of server, execute directly.
+			return false
+		}
 		_, ok := oph.or[args.Id.ClientId]
 		if !ok {
 			return false

@@ -50,7 +50,7 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	reply := GetReply{}
 
-	args = GetArgs{clientRequestIdentity{ck.id, nrand()}, key}
+	args = GetArgs{ClientRequestIdentity{ck.id, nrand()}, key}
 
 	for {
 		reply = GetReply{}
@@ -79,7 +79,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		log.Fatalf("unknown op %v", op)
 	}
 
-	args := PutAppendArgs{clientRequestIdentity{ck.id, nrand()}, key, value}
+	args := PutAppendArgs{ClientRequestIdentity{ck.id, nrand()}, key, value}
 
 	for {
 		reply := PutAppendReply{}

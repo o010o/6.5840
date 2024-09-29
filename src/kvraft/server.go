@@ -30,7 +30,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type clientRequestIdentity struct {
+type ClientRequestIdentity struct {
 	ClientId  int64
 	RequestId int64
 }
@@ -39,7 +39,7 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Id    clientRequestIdentity
+	Id    ClientRequestIdentity
 	T     OpType
 	Key   string
 	Value string
